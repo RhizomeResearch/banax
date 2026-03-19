@@ -6,7 +6,7 @@ A deep equilibrium model (DEQ) replaces a deep network
 with the fixed point of a contractive function `f`:
 instead of unrolling layers,
 it solves `f(x) = x` and differentiates through the solution.
-**banax** provides the solvers that find those fixed points,
+**Banax** provides the solvers that find those fixed points,
 the adjoint methods that differentiate through them,
 as well as utilities to train DEQ models
 such as Jacobian regularization loss terms.
@@ -76,6 +76,14 @@ This convention appears consistently
 across solvers, adjoints, and regularization functions.
 
 ## Solvers
+
+| class | method | notes |
+|---|---|---|
+| `Picard` | standard fixed-point iteration | simplest; converges when spectral radius < 1 |
+| `Relaxed` | damped iteration: `x ← (1−β)x + βf(x)` | `damp=β`; widens convergence basin |
+| `Reversible` | two-sequence reversible scheme | O(1) memory backward pass; pairs with `Reversible` adjoint |
+| `Broyden` | limited-memory quasi-Newton | rank-1 inverse Jacobian updates; optional Armijo line search |
+| `Anderson` | Anderson acceleration | least-squares mixing over recent iterates; fastest near fixed point |
 
 All solvers inherit from `Solver` and share the same keyword arguments:
 
@@ -205,6 +213,18 @@ frob = hutchinson_jacobian_frobenius((f, (W, b)), x_star, n_steps=10, key=key)
 ```
 
 Add any of these as a penalty term to your training loss.
+
+## Acknowledgements
+
+**Banax** was inspired by and learned from several excellent projects:
+
+- [**torchdeq**](https://github.com/locuslab/torchdeq) — a comprehensive DEQ library for PyTorch that shaped many of the solver and adjoint interfaces here
+- [**revdeq**](https://github.com/sammccallum/revdeq) — the reversible DEQ adjoint that motivated the `Reversible` solver/adjoint pair
+- [**optimistix**](https://github.com/patrick-kidger/optimistix) — a JAX-based nonlinear solvers library whose clean design influenced the solver API
+
+Grateful to the [**JAX**](https://github.com/google/jax)
+and [**Equinox**](https://github.com/patrick-kidger/equinox) teams
+for the foundations that make this library possible.
 
 ## License
 
