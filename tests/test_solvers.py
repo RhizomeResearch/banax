@@ -8,7 +8,13 @@ import pytest
 
 from banax._core import Result
 from banax.solver import _abs_err, _rel_err
-from banax.solver import Picard, Relaxed, Reversible as ReversibleSolver
+from banax.solver import (
+    Picard,
+    Relaxed,
+    Reversible as ReversibleSolver,
+    Broyden,
+    Anderson,
+)
 from banax.adjoint import BPTT
 from banax.adjoint import Reversible
 
@@ -138,6 +144,106 @@ class TestReversibleSolver:
                 loop_kind="lax",
             )
         )(pytree_f, x0)
+        assert jnp.allclose(sol.value["a"], 2.0, atol=1e-4)
+        assert jnp.allclose(sol.value["b"], 4.0, atol=1e-4)
+
+
+# ── TestBroyden ──────────────────────────────────────────────────────────
+
+
+class TestBroyden:
+    def _solver(self, **kw):
+        defaults = dict(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS, history_size=10)
+        defaults.update(kw)
+        return Broyden(**defaults)
+
+    def test_scalar_fixed_point(self):
+        solver = self._solver()
+        sol, _ = solver._solve((linear, (0.5, 1.0)), x0=jnp.array(0.0))
+        assert jnp.allclose(sol.value, 2.0, atol=1e-4)
+
+    def test_vector_fixed_point(self):
+        A = jnp.array([[0.0, 0.25], [0.25, 0.0]])
+        b = jnp.array([1.0, 2.0])
+        solver = self._solver()
+        sol, _ = solver._solve((affine, (A, b)), x0=jnp.zeros(2))
+        expected = jnp.linalg.solve(jnp.eye(2) - A, b)
+        assert jnp.allclose(sol.value, expected, atol=1e-4)
+
+    def test_pytree_fixed_point(self):
+        solver = self._solver()
+        x0 = {"a": jnp.array(0.0), "b": jnp.array(0.0)}
+        sol, _ = solver._solve(pytree_f, x0)
+        assert jnp.allclose(sol.value["a"], 2.0, atol=1e-4)
+        assert jnp.allclose(sol.value["b"], 4.0, atol=1e-4)
+
+    def test_fewer_steps_than_picard(self):
+        """Broyden should converge in fewer steps on a hard-ish problem."""
+        a, b = 0.9, 1.0  # spectral radius 0.9 — slow for Picard
+        picard = Picard(atol=1e-4, rtol=0.0, max_steps=500)
+        broyden = self._solver(atol=1e-4, rtol=0.0, max_steps=500)
+        sol_p, _ = picard._solve((linear, (a, b)), x0=jnp.array(0.0))
+        sol_b, _ = broyden._solve((linear, (a, b)), x0=jnp.array(0.0))
+        assert sol_b.stats.steps < sol_p.stats.steps
+
+
+# ── TestAnderson ─────────────────────────────────────────────────────────
+
+
+class TestAnderson:
+    def _solver(self, **kw):
+        defaults = dict(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS, depth=5)
+        defaults.update(kw)
+        return Anderson(**defaults)
+
+    def test_scalar_fixed_point(self):
+        solver = self._solver()
+        sol, _ = solver._solve((linear, (0.5, 1.0)), x0=jnp.array(0.0))
+        assert jnp.allclose(sol.value, 2.0, atol=1e-4)
+
+    def test_vector_fixed_point(self):
+        A = jnp.array([[0.0, 0.25], [0.25, 0.0]])
+        b = jnp.array([1.0, 2.0])
+        solver = self._solver()
+        sol, _ = solver._solve((affine, (A, b)), x0=jnp.zeros(2))
+        expected = jnp.linalg.solve(jnp.eye(2) - A, b)
+        assert jnp.allclose(sol.value, expected, atol=1e-4)
+
+    def test_pytree_fixed_point(self):
+        solver = self._solver()
+        x0 = {"a": jnp.array(0.0), "b": jnp.array(0.0)}
+        sol, _ = solver._solve(pytree_f, x0)
+        assert jnp.allclose(sol.value["a"], 2.0, atol=1e-4)
+        assert jnp.allclose(sol.value["b"], 4.0, atol=1e-4)
+
+    def test_fewer_steps_than_picard(self):
+        """Anderson should converge in fewer steps on a hard-ish problem."""
+        a, b = 0.9, 1.0
+        picard = Picard(atol=1e-4, rtol=0.0, max_steps=500)
+        anderson = self._solver(atol=1e-4, rtol=0.0, max_steps=500)
+        sol_p, _ = picard._solve((linear, (a, b)), x0=jnp.array(0.0))
+        sol_a, _ = anderson._solve((linear, (a, b)), x0=jnp.array(0.0))
+        assert sol_a.stats.steps < sol_p.stats.steps
+
+    @pytest.mark.parametrize("use_linalg", [True, False], ids=["linalg", "cholesky"])
+    def test_cholesky_matches_linalg(self, use_linalg):
+        """Both solver backends produce the same fixed point."""
+        solver = self._solver(use_linalg=use_linalg)
+        sol, _ = solver._solve((linear, (0.5, 1.0)), x0=jnp.array(0.0))
+        assert jnp.allclose(sol.value, 2.0, atol=1e-4)
+
+    def test_cholesky_vector(self):
+        A = jnp.array([[0.0, 0.25], [0.25, 0.0]])
+        b = jnp.array([1.0, 2.0])
+        solver = self._solver(use_linalg=False)
+        sol, _ = solver._solve((affine, (A, b)), x0=jnp.zeros(2))
+        expected = jnp.linalg.solve(jnp.eye(2) - A, b)
+        assert jnp.allclose(sol.value, expected, atol=1e-4)
+
+    def test_cholesky_pytree(self):
+        solver = self._solver(use_linalg=False)
+        x0 = {"a": jnp.array(0.0), "b": jnp.array(0.0)}
+        sol, _ = solver._solve(pytree_f, x0)
         assert jnp.allclose(sol.value["a"], 2.0, atol=1e-4)
         assert jnp.allclose(sol.value["b"], 4.0, atol=1e-4)
 

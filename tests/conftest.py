@@ -4,7 +4,13 @@ jax.config.update("jax_numpy_rank_promotion", "raise")
 jax.config.update("jax_numpy_dtype_promotion", "strict")
 
 
-from banax.solver import Picard, Relaxed, Reversible as ReversibleSolver
+from banax.solver import (
+    Picard,
+    Relaxed,
+    Reversible as ReversibleSolver,
+    Broyden,
+    Anderson,
+)
 from banax.adjoint import BPTT, JFB, Implicit, UnrollPhantom, NeumannPhantom
 from banax.adjoint import Reversible
 
@@ -42,6 +48,8 @@ def pytree_f(x):
 
 P = Picard(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS)
 P_BWD = Picard(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS, loop_kind="checkpointed")
+B = Broyden(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS, history_size=10)
+A = Anderson(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS, depth=5)
 
 # ── Adjoint factories ──────────────────────────────────────────────────────
 
@@ -86,10 +94,48 @@ def neumann(n):
     )
 
 
+def broyden_jfb():
+    return JFB(solver=B)
+
+
+def anderson_jfb():
+    return JFB(solver=A)
+
+
+def broyden_implicit():
+    return Implicit(solver=B, b_solver=P)
+
+
+def anderson_implicit():
+    return Implicit(solver=A, b_solver=P)
+
+
 # ── Parametrize groups ─────────────────────────────────────────────────────
 
-ALL_ADJOINTS = [bptt, jfb, implicit, rev, lambda: phantom(10), lambda: neumann(10)]
-ALL_ADJOINT_IDS = ["bptt", "jfb", "implicit", "rev", "phantom10", "neumann10"]
+ALL_ADJOINTS = [
+    bptt,
+    jfb,
+    implicit,
+    rev,
+    lambda: phantom(10),
+    lambda: neumann(10),
+    broyden_jfb,
+    anderson_jfb,
+    broyden_implicit,
+    anderson_implicit,
+]
+ALL_ADJOINT_IDS = [
+    "bptt",
+    "jfb",
+    "implicit",
+    "rev",
+    "phantom10",
+    "neumann10",
+    "broyden_jfb",
+    "anderson_jfb",
+    "broyden_implicit",
+    "anderson_implicit",
+]
 
 EXACT_ADJOINTS = [bptt, implicit, rev]
 EXACT_ADJOINT_IDS = ["bptt", "implicit", "rev"]

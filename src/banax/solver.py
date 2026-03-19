@@ -1,6 +1,8 @@
 from abc import abstractmethod
+from functools import partial
 
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import equinox as eqx
 import equinox.internal as eqxi
@@ -245,3 +247,190 @@ class Reversible[Z: T](Solver[Z, tuple[Z, Z]]):
         x_next = (wx_next**ω)[1].ω
 
         return x_next, fx_next, (w_next, fx_next)
+
+
+class Broyden[Z: T](Solver[Z, tuple]):
+    """Limited-memory Broyden's method for fixed-point iteration.
+
+    Maintains a low-rank approximation to the inverse Jacobian of g(x) = f(x) - x.
+    Converges faster than Picard on many problems, especially when the Jacobian
+    spectral radius is close to 1.
+
+    .. note::
+        This implementation always uses step size 1 (no line search).
+        A line search would improve robustness on problems near the stability
+        boundary but requires a variable number of ``f`` calls per step,
+        which is incompatible with the fixed ``while_loop`` body.
+        For well-conditioned contractive ``f`` (the typical DEQ setting)
+        step size 1 is sufficient.
+
+    Args:
+        history_size: Number of rank-1 updates to retain. Default ``10``.
+    """
+
+    type State = tuple
+    history_size: int = eqx.field(static=True, default=10, kw_only=True)
+
+    def init(self, f: Fn[Z], x0: Z) -> State:
+        fx0 = f(x0)
+        x_flat, _ = jax.flatten_util.ravel_pytree(x0)
+        n = x_flat.shape[0]
+        fx_flat, _ = jax.flatten_util.ravel_pytree(fx0)
+        g_flat = fx_flat - x_flat
+        U = jnp.zeros((self.history_size, n))
+        V = jnp.zeros((self.history_size, n))
+        return fx0, g_flat, U, V, jnp.array(0)
+
+    def step(self, f: Fn[Z], x: Z, state: State) -> tuple[Z, Z, State]:
+        fx_prev, g_flat, U, V, idx = state
+
+        x_flat, unflatten = jax.flatten_util.ravel_pytree(x)
+
+        # Broyden direction: dx = -J^{-1} g = g - U^T (V g)
+        Vg = V @ g_flat  # [history_size]
+        dx = g_flat - U.T @ Vg  # [n]
+
+        x_next_flat = x_flat + dx
+        x_next = unflatten(x_next_flat)
+        fx_next = f(x_next)
+
+        # Good Broyden (Type-I) rank-1 update
+        fx_next_flat, _ = jax.flatten_util.ravel_pytree(fx_next)
+        g_next_flat = fx_next_flat - x_next_flat
+        dg = g_next_flat - g_flat
+
+        # J^{-1} dg = -dg + U^T (V dg)
+        Vdg = V @ dg
+        Jinv_dg = U.T @ Vdg - dg
+
+        # v^T = dx^T J^{-1} = -dx^T + (U dx)^T V
+        Udx = U @ dx  # [history_size]
+        vT = -dx + Udx @ V  # [n]
+
+        numerator = dx - Jinv_dg
+        denom = vT @ dg + 1e-12
+
+        # Update U, V ring buffer at position idx % history_size
+        slot = idx % self.history_size
+        u_new = numerator / denom
+        U = U.at[slot].set(u_new)
+        V = V.at[slot].set(vT)
+
+        return x_next, fx_next, (fx_next, g_next_flat, U, V, idx + 1)
+
+
+def _cholesky_solve(A, b, n):
+    """Solve A x = b for small SPD A without ``jnp.linalg``.
+
+    Uses ``jax.lax.fori_loop`` so the compiled graph is O(1) in ``n``
+    and contains no linalg kernels (ONNX-exportable).
+    """
+
+    # Cholesky factorization: A = L L^T
+    def _chol_inner(_i, _j, _L):
+        mask = (jnp.arange(n) < _j).astype(A.dtype)
+        s = _L[_i] * mask @ _L[_j]
+        return _L.at[_i, _j].set((A[_i, _j] - s) / _L[_j, _j])
+
+    def _chol_outer(_i, _L):
+        _L = jax.lax.fori_loop(0, _i, partial(_chol_inner, _i), _L)
+        mask = (jnp.arange(n) < _i).astype(A.dtype)
+        s = _L[_i] * mask @ _L[_i]
+        return _L.at[_i, _i].set(jnp.sqrt(jnp.maximum(A[_i, _i] - s, 1e-30)))
+
+    L = jax.lax.fori_loop(0, n, _chol_outer, jnp.zeros_like(A))
+
+    # Forward substitution: L y = b
+    def _fwd(_i, _y):
+        mask = (jnp.arange(n) < _i).astype(b.dtype)
+        s = L[_i] * mask @ _y
+        return _y.at[_i].set((b[_i] - s) / L[_i, _i])
+
+    y = jax.lax.fori_loop(0, n, _fwd, jnp.zeros_like(b))
+
+    # Back substitution: L^T x = y
+    def _bwd(_ki, _x):
+        i = n - 1 - _ki
+        mask = (jnp.arange(n) > i).astype(b.dtype)
+        s = L[:, i] * mask @ _x
+        return _x.at[i].set((y[i] - s) / L[i, i])
+
+    return jax.lax.fori_loop(0, n, _bwd, jnp.zeros_like(b))
+
+
+class Anderson[Z: T](Solver[Z, tuple]):
+    """Anderson acceleration for fixed-point iteration.
+
+    Maintains a history of iterates and residuals,
+    solving a small least-squares problem in each step
+    to find optimal mixing coefficients.
+
+    Args:
+        depth: Number of history entries for mixing. Default ``5``.
+        damp: Damping factor beta in (0, 1]. Default ``1.0``.
+        ridge: Regularization for the normal equations. Default ``1e-6``.
+        use_linalg: If ``True`` (default),
+            use ``jnp.linalg.solve`` for the normal equations.
+            If ``False``, use a hand-rolled Cholesky decomposition
+            that requires no linear algebra backend,
+            suitable for embedded or restricted hardware targets.
+    """
+
+    type State = tuple
+    depth: int = eqx.field(static=True, default=5, kw_only=True)
+    damp: float = eqx.field(static=True, default=1.0, kw_only=True)
+    ridge: float = eqx.field(static=True, default=1e-6, kw_only=True)
+    use_linalg: bool = eqx.field(static=True, default=True, kw_only=True)
+
+    def init(self, f: Fn[Z], x0: Z) -> State:
+        fx0 = f(x0)
+        x_flat, _ = jax.flatten_util.ravel_pytree(x0)
+        n = x_flat.shape[0]
+        fx_flat, _ = jax.flatten_util.ravel_pytree(fx0)
+        g_flat = fx_flat - x_flat
+        X_hist = jnp.zeros((self.depth, n))
+        G_hist = jnp.zeros((self.depth, n))
+        X_hist = X_hist.at[0].set(x_flat)
+        G_hist = G_hist.at[0].set(g_flat)
+        return fx0, g_flat, X_hist, G_hist, jnp.array(1)
+
+    def step(self, f: Fn[Z], x: Z, state: State) -> tuple[Z, Z, State]:
+        fx_prev, g_flat, X_hist, G_hist, idx = state
+
+        x_flat, unflatten = jax.flatten_util.ravel_pytree(x)
+        m = jnp.minimum(idx, self.depth)
+        cur = idx % self.depth
+
+        # Build difference matrices via gather + broadcast
+        rolled = (cur - 1 - jnp.arange(self.depth)) % self.depth
+        DG = g_flat[None, :] - G_hist[rolled]  # [depth, n]
+        DX = x_flat[None, :] - X_hist[rolled]  # [depth, n]
+
+        # Mask out invalid entries (beyond current history)
+        indices = jnp.arange(self.depth)
+        mask = (indices < m).astype(x_flat.dtype)
+        DG = DG * mask[:, None]
+        DX = DX * mask[:, None]
+
+        # Solve normal equations: (DG^T DG + ridge * I) gamma = DG^T g
+        GTG = DG @ DG.T + self.ridge * jnp.eye(self.depth)
+        GTg = DG @ g_flat
+        if self.use_linalg:
+            gamma = jnp.linalg.solve(GTG, GTg)
+        else:
+            gamma = _cholesky_solve(GTG, GTg, self.depth)
+        gamma = gamma * mask
+
+        # Anderson update: x_next = x + beta * g - (DX + beta * DG) @ gamma
+        x_next_flat = x_flat + self.damp * g_flat - (DX + self.damp * DG).T @ gamma
+
+        x_next = unflatten(x_next_flat)
+        fx_next = f(x_next)
+
+        # Update ring buffer
+        fx_next_flat, _ = jax.flatten_util.ravel_pytree(fx_next)
+        g_next_flat = fx_next_flat - x_next_flat
+        X_hist = X_hist.at[cur].set(x_next_flat)
+        G_hist = G_hist.at[cur].set(g_next_flat)
+
+        return x_next, fx_next, (fx_next, g_next_flat, X_hist, G_hist, idx + 1)

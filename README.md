@@ -19,7 +19,7 @@ pip install banax
 
 ```
 banax/
-  solver.py         — iterative fixed-point solvers (Picard, Relaxed, Reversible)
+  solver.py         — iterative fixed-point solvers (Picard, Relaxed, Reversible, Broyden, Anderson)
   adjoint.py        — adjoint / differentiation methods (BPTT, JFB, Implicit, …)
   regularization.py — Jacobian regularization utilities
   _core.py          — shared types (T, FSpec, …)
@@ -79,7 +79,11 @@ All solvers inherit from `Solver` and share the same keyword arguments:
 | `rtol` | `1e-5` | relative tolerance (disabled if `0.0`) |
 | `max_steps` | `50` | iteration cap |
 | `loop_kind` | `"lax"` | `"lax"` / `"bounded"` / `"checkpointed"` |
-| `damp` | `0.8` | damping factor β (`Relaxed` and `Reversible` only) |
+| `damp` | `0.8` | damping factor β (`Relaxed`, `Reversible`, and `Anderson`) |
+| `history_size` | `10` | Broyden rank-1 update history (`Broyden` only) |
+| `depth` | `5` | mixing history length (`Anderson` only) |
+| `ridge` | `1e-6` | normal-equation regularization (`Anderson` only) |
+| `use_linalg` | `True` | if `False`, use hand-rolled Cholesky instead of `jnp.linalg.solve` (`Anderson` only) |
 
 `loop_kind` controls how equinox unrolls the iteration. `"lax"` uses
 `jax.lax.while_loop` (not differentiable through the loop). `"bounded"` and
@@ -87,16 +91,23 @@ All solvers inherit from `Solver` and share the same keyword arguments:
 trades memory for recomputation.
 
 ```python
-from banax.solver import Picard, Relaxed, Reversible as ReversibleSolver
+from banax.solver import Picard, Relaxed, Reversible as ReversibleSolver, Broyden, Anderson
 
 Picard(atol=1e-5, max_steps=50)
 Relaxed(damp=0.8, atol=1e-5, rtol=0.0, max_steps=50)
 ReversibleSolver(damp=0.8, atol=1e-5, max_steps=20)
+Broyden(history_size=10, atol=1e-5, max_steps=50)
+Anderson(depth=5, damp=1.0, ridge=1e-6, atol=1e-5, max_steps=50)
 ```
 
 `Relaxed` applies damping: `x ← (1 − β) x + β f(x)` where `damp=β`. `Reversible`
 uses a two-sequence scheme that reconstructs the iteration trajectory during the
 backward pass without storing all intermediate iterates.
+
+`Broyden` uses a limited-memory quasi-Newton update on the residual `g(x) = f(x) - x`,
+maintaining a low-rank inverse Jacobian approximation. `Anderson` acceleration solves
+a small least-squares problem over recent iterates to find optimal mixing coefficients.
+Both converge faster than Picard when the Jacobian spectral radius is close to 1.
 
 ## Adjoint methods
 
