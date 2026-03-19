@@ -186,6 +186,21 @@ class TestBroyden:
         sol_b, _ = broyden._solve((linear, (a, b)), x0=jnp.array(0.0))
         assert sol_b.stats.steps < sol_p.stats.steps
 
+    def test_ls_scalar(self):
+        solver = self._solver(ls_steps=5)
+        sol, _ = solver._solve((linear, (0.5, 1.0)), x0=jnp.array(0.0))
+        assert jnp.allclose(sol.value, 2.0, atol=1e-4)
+
+    def test_ls_matches_no_ls(self):
+        """Line search should find the same fixed point as no line search."""
+        A = jnp.array([[0.0, 0.25], [0.25, 0.0]])
+        b = jnp.array([1.0, 2.0])
+        solver_no_ls = self._solver()
+        solver_ls = self._solver(ls_steps=5)
+        sol_no, _ = solver_no_ls._solve((affine, (A, b)), x0=jnp.zeros(2))
+        sol_ls, _ = solver_ls._solve((affine, (A, b)), x0=jnp.zeros(2))
+        assert jnp.allclose(sol_no.value, sol_ls.value, atol=1e-4)
+
 
 # ── TestAnderson ─────────────────────────────────────────────────────────
 

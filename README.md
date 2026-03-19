@@ -1,11 +1,15 @@
-# banax
+# Banax
 
 Deep equilibrium models in JAX/Equinox.
 
-A deep equilibrium model (DEQ) replaces a deep network with the fixed point of a
-contractive function `f`: instead of unrolling layers, it solves `f(x) = x` and
-differentiates through the solution. **banax** provides the solvers that find those
-fixed points and the adjoint methods that differentiate through them.
+A deep equilibrium model (DEQ) replaces a deep network
+with the fixed point of a contractive function `f`:
+instead of unrolling layers,
+it solves `f(x) = x` and differentiates through the solution.
+**banax** provides the solvers that find those fixed points,
+the adjoint methods that differentiate through them,
+as well as utilities to train DEQ models
+such as Jacobian regularization loss terms.
 
 ## Installation
 
@@ -25,8 +29,9 @@ banax/
   _core.py          — shared types (T, FSpec, …)
 ```
 
-The main entry point is an `Adjoint`. It wraps a `Solver` and exposes a single
-`()` method that finds the fixed point and handles gradients.
+The main entry point is an `Adjoint`.
+It wraps a `Solver` and exposes a single `__call__()` method
+that finds the fixed point and handles gradients.
 
 ## Basic usage
 
@@ -47,13 +52,14 @@ x_star = sol.value          # fixed point; carries gradients
 steps  = sol.stats.steps    # number of iterations taken
 ```
 
-Calling the adjoint returns a `Solution` object. The fixed point `sol.value`
-carries gradients — use it in a loss and call `jax.grad` normally.
+Calling the adjoint returns a `Solution` object.
+The fixed point `sol.value` carries gradients:
+use it in a loss and call `jax.grad` normally.
 
 ## f_spec
 
-Functions are passed as an **`FSpec`**: a bare callable, or a tuple bundling the
-callable with its extra arguments.
+Functions are passed as an **`FSpec`**: a bare callable,
+or a tuple bundling the callable with its extra arguments.
 
 ```python
 # bare callable — f takes only x
@@ -66,8 +72,8 @@ adjoint((f, (W, b)), x0)
 adjoint((f, (W,), {"bias": b}), x0)
 ```
 
-This convention appears consistently across solvers, adjoints, and regularization
-functions.
+This convention appears consistently
+across solvers, adjoints, and regularization functions.
 
 ## Solvers
 
@@ -80,7 +86,8 @@ All solvers inherit from `Solver` and share the same keyword arguments:
 | `max_steps` | `50` | iteration cap |
 | `loop_kind` | `"lax"` | `"lax"` / `"bounded"` / `"checkpointed"` |
 | `damp` | `0.8` | damping factor β (`Relaxed`, `Reversible`, and `Anderson`) |
-| `history_size` | `10` | Broyden rank-1 update history (`Broyden` only) |
+| `history_size` | `10` | rank-1 update history (`Broyden` only) |
+| `ls_steps` | `0` | Armijo backtracking halvings per step; `0` disables line search (`Broyden` only) |
 | `depth` | `5` | mixing history length (`Anderson` only) |
 | `ridge` | `1e-6` | normal-equation regularization (`Anderson` only) |
 | `use_linalg` | `True` | if `False`, use hand-rolled Cholesky instead of `jnp.linalg.solve` (`Anderson` only) |
@@ -96,23 +103,30 @@ from banax.solver import Picard, Relaxed, Reversible as ReversibleSolver, Broyde
 Picard(atol=1e-5, max_steps=50)
 Relaxed(damp=0.8, atol=1e-5, rtol=0.0, max_steps=50)
 ReversibleSolver(damp=0.8, atol=1e-5, max_steps=20)
-Broyden(history_size=10, atol=1e-5, max_steps=50)
+Broyden(history_size=10, atol=1e-5, max_steps=50)           # ls_steps=0: no line search
+Broyden(history_size=10, ls_steps=5, atol=1e-5, max_steps=50)  # Armijo backtracking
 Anderson(depth=5, damp=1.0, ridge=1e-6, atol=1e-5, max_steps=50)
 ```
 
-`Relaxed` applies damping: `x ← (1 − β) x + β f(x)` where `damp=β`. `Reversible`
-uses a two-sequence scheme that reconstructs the iteration trajectory during the
-backward pass without storing all intermediate iterates.
+`Relaxed` applies damping: `x ← (1 − β) x + β f(x)` where `damp=β`.
+`Reversible` uses a two-sequence scheme
+that reconstructs the iteration trajectory during the backward pass
+without storing all intermediate iterates.
 
 `Broyden` uses a limited-memory quasi-Newton update on the residual `g(x) = f(x) - x`,
-maintaining a low-rank inverse Jacobian approximation. `Anderson` acceleration solves
-a small least-squares problem over recent iterates to find optimal mixing coefficients.
-Both converge faster than Picard when the Jacobian spectral radius is close to 1.
+maintaining a low-rank inverse Jacobian approximation.
+Setting `ls_steps > 0` enables Armijo backtracking line search,
+up to `ls_steps` step-size halvings per iteration;
+this is incompatible with `BPTT` and `Reversible` adjoints.
+`Anderson` acceleration solves a small least-squares problem over recent iterates
+to find optimal mixing coefficients.
+Both converge faster than Picard
+when the Jacobian spectral radius is close to 1.
 
 ## Adjoint methods
 
 Adjoint methods control how gradients flow through the fixed-point equation.
-They all wrap a `Solver` and expose the same `()` interface.
+They all wrap a `Solver` and expose the same `__call__()` interface.
 
 | class | gradient method | notes |
 |---|---|---|
@@ -166,8 +180,9 @@ trajectory = sol.aux[:sol.stats.steps]
 
 ## Regularization
 
-Three Jacobian regularizers for penalizing the spectral or Frobenius norm of
-`df/dx` at the fixed point, all accepting an `FSpec`:
+Three Jacobian regularizers for penalizing
+the spectral or Frobenius norm of `df/dx` at the fixed point,
+all accepting an `FSpec`:
 
 ```python
 from banax.regularization import (

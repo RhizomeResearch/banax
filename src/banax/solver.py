@@ -253,23 +253,28 @@ class Broyden[Z: T](Solver[Z, tuple]):
     """Limited-memory Broyden's method for fixed-point iteration.
 
     Maintains a low-rank approximation to the inverse Jacobian of g(x) = f(x) - x.
-    Converges faster than Picard on many problems, especially when the Jacobian
-    spectral radius is close to 1.
-
-    .. note::
-        This implementation always uses step size 1 (no line search).
-        A line search would improve robustness on problems near the stability
-        boundary but requires a variable number of ``f`` calls per step,
-        which is incompatible with the fixed ``while_loop`` body.
-        For well-conditioned contractive ``f`` (the typical DEQ setting)
-        step size 1 is sufficient.
+    Converges faster than Picard on many problems,
+    especially when the Jacobian spectral radius is close to 1.
 
     Args:
         history_size: Number of rank-1 updates to retain. Default ``10``.
+        ls_steps: Maximum number of Armijo backtracking halvings per step.
+            ``0`` (default) disables line search entirely.
+            When enabled, the step size ``alpha`` is halved
+            until ``‖g(x + alpha·dx)‖² ≤ (1 − 2e−4·alpha)·‖g(x)‖²``
+            or ``ls_steps`` halvings are exhausted.
+
+            .. note::
+                Line search uses an inner ``jax.lax.while_loop``,
+                which is not differentiable.
+                ``ls_steps > 0`` is therefore incompatible with
+                :class:`~banax.adjoint.BPTT` and
+                :class:`~banax.adjoint.Reversible` adjoints.
     """
 
     type State = tuple
     history_size: int = eqx.field(static=True, default=10, kw_only=True)
+    ls_steps: int = eqx.field(static=True, default=0, kw_only=True)
 
     def init(self, f: Fn[Z], x0: Z) -> State:
         fx0 = f(x0)
@@ -290,9 +295,49 @@ class Broyden[Z: T](Solver[Z, tuple]):
         Vg = V @ g_flat  # [history_size]
         dx = g_flat - U.T @ Vg  # [n]
 
-        x_next_flat = x_flat + dx
-        x_next = unflatten(x_next_flat)
-        fx_next = f(x_next)
+        if self.ls_steps > 0:
+            # Armijo backtracking: halve alpha until
+            # ‖g(x + alpha·dx)‖² ≤ (1 − 2e−4·alpha)·‖g‖²
+            g_sq_curr = g_flat @ g_flat
+
+            def _ls_cond(_carry):
+                _alpha, _x_next_flat, _fx_next, _g_sq_next = _carry
+                return _g_sq_next > (1 - 2e-4 * _alpha) * g_sq_curr
+
+            def _ls_body(_carry):
+                _alpha, _, _, _ = _carry
+                _alpha_new = _alpha * 0.5
+                _x_trial_flat = x_flat + _alpha_new * dx
+                _fx_trial = f(unflatten(_x_trial_flat))
+                _fx_trial_flat, _ = jax.flatten_util.ravel_pytree(_fx_trial)
+                _g_trial_flat = _fx_trial_flat - _x_trial_flat
+                return (
+                    _alpha_new,
+                    _x_trial_flat,
+                    _fx_trial,
+                    _g_trial_flat @ _g_trial_flat,
+                )
+
+            x_next_flat_init = x_flat + dx
+            fx_next_init = f(unflatten(x_next_flat_init))
+            fx_next_flat_init, _ = jax.flatten_util.ravel_pytree(fx_next_init)
+            g_next_flat_init = fx_next_flat_init - x_next_flat_init
+
+            init_carry = (
+                jnp.array(1.0),
+                x_next_flat_init,
+                fx_next_init,
+                g_next_flat_init @ g_next_flat_init,
+            )
+            alpha, x_next_flat, fx_next, _ = eqxi.while_loop(
+                _ls_cond, _ls_body, init_carry, max_steps=self.ls_steps, kind="lax"
+            )
+            dx = alpha * dx
+            x_next = unflatten(x_next_flat)
+        else:
+            x_next_flat = x_flat + dx
+            x_next = unflatten(x_next_flat)
+            fx_next = f(x_next)
 
         # Good Broyden (Type-I) rank-1 update
         fx_next_flat, _ = jax.flatten_util.ravel_pytree(fx_next)
