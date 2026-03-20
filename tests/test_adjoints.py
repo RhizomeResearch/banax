@@ -8,8 +8,9 @@ import jax.numpy as jnp
 import pytest
 
 from banax.solver import Picard, Relaxed
-from banax.adjoint import BPTT, JFB, UnrollPhantom, NeumannPhantom
+from banax.adjoint import BPTT, JFB, UnrollPhantom, NeumannPhantom, GDEQ
 from banax.adjoint import Reversible
+from banax.solver import Broyden as BroydenSolver
 
 from conftest import (
     ATOL,
@@ -187,6 +188,52 @@ class TestGradientBias:
         g_few = jax.grad(loss_neumann)(w, 3)
         g_many = jax.grad(loss_neumann)(w, 20)
         assert jnp.abs(g_many - g_true) < jnp.abs(g_few - g_true)
+
+
+# ── TestGDEQ ─────────────────────────────────────────────────────────────
+
+
+class TestGDEQ:
+    def test_grad_better_than_jfb(self):
+        """GDEQ gradient should be closer to BPTT than JFB on a nonlinear f.
+
+        We use f(x, w) = tanh(w * x), which has a spectral radius < 1 near x=0
+        for |w| < 1. Broyden accumulates rank-1 updates during the forward solve,
+        so GDEQ's B^T preconditioning carries more Jacobian information than
+        the identity (JFB baseline).
+        """
+
+        def nonlinear(x, w):
+            return jnp.tanh(w * x + 0.3)
+
+        w = jnp.array(0.7)
+        x0 = jnp.array(0.0)
+
+        p_bwd = BPTT(
+            solver=Picard(atol=1e-7, rtol=0.0, max_steps=200, loop_kind="checkpointed")
+        )
+
+        def loss(adj, w):
+            sol = adj((nonlinear, (w,)), x0)
+            return jnp.sum(sol.value**2)
+
+        g_bptt = jax.grad(loss, argnums=1)(p_bwd, w)
+        g_jfb = jax.grad(loss, argnums=1)(
+            JFB(solver=Picard(atol=1e-7, rtol=0.0, max_steps=200)), w
+        )
+        g_gdeq = jax.grad(loss, argnums=1)(
+            GDEQ(solver=BroydenSolver(atol=1e-7, rtol=0.0, max_steps=200)), w
+        )
+
+        assert jnp.isfinite(g_gdeq), f"GDEQ gradient is not finite: {g_gdeq}"
+        assert jnp.abs(g_gdeq - g_bptt) < jnp.abs(g_jfb - g_bptt), (
+            f"GDEQ error={jnp.abs(g_gdeq - g_bptt):.4f} >= "
+            f"JFB error={jnp.abs(g_jfb - g_bptt):.4f}"
+        )
+
+    def test_rejects_non_broyden_solver(self):
+        with pytest.raises(TypeError, match="Broyden"):
+            GDEQ(solver=Picard())  # type: ignore[arg-type]
 
 
 # ── TestValidation ────────────────────────────────────────────────────────

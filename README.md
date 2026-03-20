@@ -141,13 +141,14 @@ They all wrap a `Solver` and expose the same `__call__()` interface.
 | `BPTT` | backprop through the unrolled iterations | exact; solver needs `loop_kind="bounded"` or `"checkpointed"` |
 | `Implicit` | implicit function theorem (IFT) | exact; requires a second `b_solver` for the backward linear system |
 | `JFB` | Jacobian-free backprop | biased; cheap; one VJP per step |
+| `GDEQ` | JFB with Broyden preconditioning | less biased than JFB; requires a `Broyden` solver |
 | `UnrollPhantom` | unrolled phantom gradient | interpolates between JFB and BPTT |
 | `NeumannPhantom` | Neumann-series phantom gradient | similar to UnrollPhantom via Neumann expansion |
 | `Reversible` | reversible adjoint | exact; O(1) memory; pairs with `ReversibleSolver` |
 
 ```python
-from banax.adjoint import BPTT, Implicit, JFB
-from banax.solver import Picard
+from banax.adjoint import BPTT, Implicit, JFB, GDEQ
+from banax.solver import Picard, Broyden
 
 solver = Picard(atol=1e-5, max_steps=50, loop_kind="checkpointed")
 b_solver = Picard(rtol=1e-8, max_steps=50, loop_kind="checkpointed")
@@ -158,8 +159,11 @@ sol = BPTT(solver=solver)((f, (W, b)), x0)
 # Exact gradient via IFT
 sol = Implicit(solver=solver, b_solver=b_solver)((f, (W, b)), x0)
 
-# Cheap biased gradient
+# Cheap biased gradient (JFB)
 sol = JFB(solver=Picard(atol=1e-6, max_steps=100))((f, (W, b)), x0)
+
+# Better-conditioned biased gradient using Broyden's inverse-Jacobian factors
+sol = GDEQ(solver=Broyden(atol=1e-6, max_steps=100))((f, (W, b)), x0)
 
 x_star = sol.value
 ```

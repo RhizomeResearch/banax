@@ -1,6 +1,7 @@
 from abc import abstractmethod
 
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import equinox as eqx
 import equinox.internal as eqxi
@@ -10,7 +11,7 @@ from typing import Callable
 from jaxtyping import PyTree
 
 from banax._core import T, FSpec, Solution, _normalize_f_spec
-from banax.solver import Solver, Relaxed, Reversible as ReversibleSolver
+from banax.solver import Solver, Relaxed, Broyden, Reversible as ReversibleSolver
 
 
 def _apply_pullback(f, f_args, f_kwargs, x):
@@ -633,3 +634,85 @@ class Reversible(Adjoint):
     ) -> Solution:
         grad_arg = _normalize_f_spec(f_spec)
         return _rev(grad_arg, x0, self.solver, aux_update, aux_init)
+
+
+@eqx.filter_custom_vjp
+def _gdeq(grad_arg, x0, solver, aux_update=None, aux_init=None):
+    solution, _ = solver._solve(
+        grad_arg, x0=x0, aux_update=aux_update, aux_init=aux_init
+    )
+    return solution
+
+
+@_gdeq.def_fwd
+def _gdeq_fwd(perturbed, grad_arg, x0, solver, aux_update=None, aux_init=None):
+    del perturbed
+
+    solution, solver_state = solver._solve(
+        grad_arg, x0=x0, aux_update=aux_update, aux_init=aux_init
+    )
+    _, _, U, V, idx = solver_state  # Broyden state: (fx, g_flat, U, V, idx)
+    return solution, (solution.value, U, V, idx)
+
+
+@_gdeq.def_bwd
+def _gdeq_bwd(
+    residuals, gradients, perturbed, grad_arg, x0, solver, aux_update, aux_init
+):
+    del perturbed, x0, solver, aux_update, aux_init
+    f, f_args, f_kwargs = grad_arg
+    x_star, U, V, idx = residuals
+    grad_x = gradients.value
+
+    history_size = U.shape[0]
+    valid_mask = (jnp.arange(history_size) < jnp.minimum(idx, history_size)).astype(
+        U.dtype
+    )
+
+    grad_flat, unflatten = jax.flatten_util.ravel_pytree(grad_x)
+    g_tilde_flat = grad_flat - V.T @ (valid_mask * (U @ grad_flat))  # B^T · grad
+    g_tilde = unflatten(g_tilde_flat)
+
+    pull = _apply_pullback(f, f_args, f_kwargs, x_star)
+    grads, _ = pull(g_tilde)
+    return grads
+
+
+class GDEQ(Adjoint):
+    """GDEQ adjoint: JFB with Broyden inverse-Jacobian preconditioning.
+
+    From Nguyen et al. (2023):
+        *Efficient Training of Deep Equilibrium Models*
+        10.48550/arXiv.2304.11663
+
+    Approximates the IFT gradient more accurately than JFB
+        by preconditioning the outgoing adjoint with ``-B^T``,
+        where ``B = I - U^T V`` is the Broyden limited-memory
+        inverse Jacobian from the forward solve.
+
+    Requires a :class:`~banax.solver.Broyden` forward solver
+        (the ``U``, ``V`` factors are read from its state).
+
+    Args:
+        solver: A :class:`~banax.solver.Broyden` instance.
+    """
+
+    solver: Broyden
+
+    def __init__(self, solver: Broyden):
+        if not isinstance(solver, Broyden):
+            raise TypeError(
+                f"GDEQ adjoint requires a Broyden solver, got {type(solver).__name__}"
+            )
+        self.solver = solver
+
+    def _loop(
+        self,
+        f_spec: FSpec[T],
+        x0: T,
+        *,
+        aux_update: Callable[..., PyTree] | None = None,
+        aux_init: PyTree | None = None,
+    ) -> Solution:
+        grad_arg = _normalize_f_spec(f_spec)
+        return _gdeq(grad_arg, x0, self.solver, aux_update, aux_init)

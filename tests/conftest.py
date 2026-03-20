@@ -11,7 +11,7 @@ from banax.solver import (
     Broyden,
     Anderson,
 )
-from banax.adjoint import BPTT, JFB, Implicit, UnrollPhantom, NeumannPhantom
+from banax.adjoint import BPTT, JFB, Implicit, UnrollPhantom, NeumannPhantom, GDEQ
 from banax.adjoint import Reversible
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -94,6 +94,10 @@ def neumann(n):
     )
 
 
+def gdeq():
+    return GDEQ(solver=B)
+
+
 def broyden_jfb():
     return JFB(solver=B)
 
@@ -123,6 +127,7 @@ ALL_ADJOINTS = [
     anderson_jfb,
     broyden_implicit,
     anderson_implicit,
+    gdeq,
 ]
 ALL_ADJOINT_IDS = [
     "bptt",
@@ -135,10 +140,11 @@ ALL_ADJOINT_IDS = [
     "anderson_jfb",
     "broyden_implicit",
     "anderson_implicit",
+    "gdeq",
 ]
 
 EXACT_ADJOINTS = [bptt, implicit, rev]
 EXACT_ADJOINT_IDS = ["bptt", "implicit", "rev"]
 
-APPROX_ADJOINTS = [jfb, lambda: phantom(10), lambda: neumann(10)]
-APPROX_ADJOINT_IDS = ["jfb", "phantom10", "neumann10"]
+APPROX_ADJOINTS = [jfb, lambda: phantom(10), lambda: neumann(10), gdeq]
+APPROX_ADJOINT_IDS = ["jfb", "phantom10", "neumann10", "gdeq"]
