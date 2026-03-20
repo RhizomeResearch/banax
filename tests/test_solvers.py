@@ -152,10 +152,20 @@ class TestReversibleSolver:
 
 
 class TestBroyden:
-    def _solver(self, **kw):
-        defaults = dict(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS, history_size=10)
-        defaults.update(kw)
-        return Broyden(**defaults)
+    def _solver(
+        self,
+        atol: float = ATOL,
+        rtol: float = RTOL,
+        max_steps: int = MAX_STEPS,
+        ls_steps: int = 0,
+    ):
+        return Broyden(
+            atol=atol,
+            rtol=rtol,
+            max_steps=max_steps,
+            history_size=10,
+            ls_steps=ls_steps,
+        )
 
     def test_scalar_fixed_point(self):
         solver = self._solver()
@@ -206,10 +216,20 @@ class TestBroyden:
 
 
 class TestAnderson:
-    def _solver(self, **kw):
-        defaults = dict(atol=ATOL, rtol=RTOL, max_steps=MAX_STEPS, depth=5)
-        defaults.update(kw)
-        return Anderson(**defaults)
+    def _solver(
+        self,
+        atol: float = ATOL,
+        rtol: float = RTOL,
+        max_steps: int = MAX_STEPS,
+        use_linalg: bool = True,
+    ):
+        return Anderson(
+            atol=atol,
+            rtol=rtol,
+            max_steps=max_steps,
+            depth=5,
+            use_linalg=use_linalg,
+        )
 
     def test_scalar_fixed_point(self):
         solver = self._solver()

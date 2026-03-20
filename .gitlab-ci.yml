@@ -1,0 +1,33 @@
+stages:
+  - lint
+  - test
+
+variables:
+  UV_CACHE_DIR: .cache/uv
+
+default:
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim  # uv pre-installed
+  cache:
+    key:
+      files:
+        - pyproject.toml
+      prefix: uv
+    paths:
+      - .cache/uv
+  before_script:
+    - uv sync --group dev
+
+lint:
+  stage: lint
+  script:
+    - uv run ruff check .
+    - uv run ruff format --check .
+    - uv run ty check
+
+test:
+  stage: test
+  script:
+    - uv run pytest --junitxml=report.xml
+  artifacts:
+    reports:
+      junit: report.xml
