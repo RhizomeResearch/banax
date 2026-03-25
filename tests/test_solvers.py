@@ -419,3 +419,54 @@ class TestSolution:
         solver = Picard(atol=0.0, rtol=0.0, max_steps=200, loop_kind="lax")
         sol, _ = solver._solve(lambda x: x * 10.0, x0=jnp.array(1.0))
         assert not jnp.isfinite(sol.value)
+        assert int(sol.result) == Result.DIVERGED
+
+
+# ── TestStepBudget ────────────────────────────────────────────────────────
+
+
+class TestStepBudget:
+    """Tests for the runtime step_budget parameter on Solver._solve()."""
+
+    def _solver(self, max_steps=MAX_STEPS):
+        # atol=rtol=0 so only the step limit terminates the loop
+        return Picard(atol=0.0, rtol=0.0, max_steps=max_steps)
+
+    def test_array_limits_steps(self):
+        sol, _ = self._solver()._solve(
+            (linear, (0.5, 1.0)), jnp.array(0.0), step_budget=jnp.array(5)
+        )
+        assert int(sol.stats.steps) <= 5
+
+    def test_none_is_noop(self):
+        solver = self._solver(max_steps=7)
+        sol_default, _ = solver._solve((linear, (0.5, 1.0)), jnp.array(0.0))
+        sol_none, _ = solver._solve(
+            (linear, (0.5, 1.0)), jnp.array(0.0), step_budget=None
+        )
+        assert int(sol_default.stats.steps) == int(sol_none.stats.steps)
+
+    def test_result_is_max_steps_when_budget_exhausted(self):
+        sol, _ = self._solver()._solve(
+            (linear, (0.5, 1.0)), jnp.array(0.0), step_budget=jnp.array(3)
+        )
+        assert int(sol.result) == Result.MAX_STEPS
+
+    def test_over_ceiling_silently_clamped(self):
+        """step_budget above max_steps: static ceiling wins silently."""
+        solver = self._solver(max_steps=5)
+        sol, _ = solver._solve(
+            (linear, (0.5, 1.0)), jnp.array(0.0), step_budget=jnp.array(1000)
+        )
+        assert int(sol.stats.steps) <= 5
+
+    def test_jit_compatible(self):
+        import jax
+
+        solver = self._solver()
+        f_spec = (linear, (0.5, 1.0))
+        x0 = jnp.array(0.0)
+        sol, _ = jax.jit(lambda b: solver._solve(f_spec, x0, step_budget=b))(
+            jnp.array(7)
+        )
+        assert int(sol.stats.steps) <= 7

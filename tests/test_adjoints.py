@@ -58,6 +58,19 @@ class TestPrimal:
         sol = make_adj()((linear, (0.5, 1.0)), jnp.array(0.0))
         assert sol.stats.steps > 0
 
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_step_budget_limits_steps(self, make_adj):
+        budget = jnp.array(4)
+        sol = make_adj()((linear, (0.5, 1.0)), jnp.array(0.0), step_budget=budget)
+        assert int(sol.stats.steps) <= budget
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_step_budget_none_unchanged(self, make_adj):
+        adj = make_adj()
+        sol_default = adj((linear, (0.5, 1.0)), jnp.array(0.0))
+        sol_none = adj((linear, (0.5, 1.0)), jnp.array(0.0), step_budget=None)
+        assert int(sol_default.stats.steps) == int(sol_none.stats.steps)
+
 
 # ── TestExactGradients ────────────────────────────────────────────────────
 
@@ -233,7 +246,7 @@ class TestGDEQ:
 
     def test_rejects_non_broyden_solver(self):
         with pytest.raises(TypeError, match="Broyden"):
-            GDEQ(solver=Picard())  # type: ignore[arg-type]
+            GDEQ(solver=Picard())  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
 
 # ── TestValidation ────────────────────────────────────────────────────────
@@ -246,7 +259,7 @@ class TestValidation:
 
     def test_reversible_adjoint_rejects_picard(self):
         with pytest.raises(TypeError):
-            Reversible(solver=Picard())  # type: ignore[arg-type]
+            Reversible(solver=Picard())  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
     def test_shape_mismatch_raises(self):
         """f_spec that returns different shape from x0 raises ValueError."""

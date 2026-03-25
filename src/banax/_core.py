@@ -70,13 +70,16 @@ class Result:
     Attributes:
         CONVERGED: ``0`` — the solver met the tolerance criterion before
             reaching ``max_steps``.
-        MAX_STEPS: ``1`` — the solver exhausted ``max_steps`` without
-            satisfying the tolerance.  The value may still be a useful
-            approximation.
+        MAX_STEPS: ``1`` — the solver exhausted ``max_steps`` (or
+            ``step_budget``) without satisfying the tolerance.  The value
+            may still be a useful approximation.
+        DIVERGED: ``2`` — the iterate became non-finite (NaN or Inf) and
+            the NaN guard stopped the loop.
     """
 
     CONVERGED = 0
     MAX_STEPS = 1
+    DIVERGED = 2
 
 
 # ── Data classes ─────────────────────────────────────────────────────────

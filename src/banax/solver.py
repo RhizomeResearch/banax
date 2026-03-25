@@ -88,7 +88,18 @@ class Solver[Z, S](eqx.Module):
         *,
         aux_update: Callable[..., PyTree] | None = None,
         aux_init: PyTree | None = None,
+        step_budget: Step | None = None,
     ) -> tuple[Solution, S]:
+        """Run the fixed-point loop.
+
+        Args:
+            step_budget: Optional runtime cap on the number of iterations.
+                Pass a JAX array (e.g. ``jnp.array(n)``) as a JIT argument
+                so it is traced as an abstract value — varying it between calls
+                does not trigger recompilation.  Must be ``<= max_steps``;
+                values above are silently clamped by the static ceiling.
+                ``None`` (default) leaves the behaviour unchanged.
+        """
         type Carry = tuple[tuple[Z, Step, Error, Error, PyTree | None], S]
 
         f, f_args, f_kwargs = _normalize_f_spec(f_spec)
@@ -96,11 +107,23 @@ class Solver[Z, S](eqx.Module):
         def _f(_x):
             return f(_x, *f_args, **f_kwargs)
 
+        def _above_tols(_aerr, _rerr) -> Bool[Array, ""] | bool:
+            """True when all active tolerance criteria are unsatisfied."""
+            if self.atol > 0.0 and self.rtol > 0.0:
+                return jnp.logical_and(_aerr > self.atol, _rerr > self.rtol)
+            elif self.atol > 0.0:
+                return _aerr > self.atol
+            elif self.rtol > 0.0:
+                return _rerr > self.rtol
+            else:
+                return True
+
         def _loop_cond(_carry: Carry) -> Bool[Array, ""]:
-            (x, _, aerr, rerr, _), _ = _carry
-            acont = aerr > self.atol if self.atol > 0.0 else jnp.array(True)
-            rcont = rerr > self.rtol if self.rtol > 0.0 else jnp.array(True)
-            return jnp.logical_and(jnp.logical_and(acont, rcont), _tree_allfinite(x))
+            (x, step, aerr, rerr, _), _ = _carry
+            running = jnp.logical_and(_above_tols(aerr, rerr), _tree_allfinite(x))
+            if step_budget is None:
+                return running
+            return jnp.logical_and(running, step < step_budget)
 
         def _loop_body(_carry: Carry) -> Carry:
             (x, step, aerr, rerr, aux), solver_state = _carry
@@ -129,8 +152,11 @@ class Solver[Z, S](eqx.Module):
         )
 
         (x, step, aerr, rerr, aux), solver_state = carry
-        converged = jnp.logical_not(_loop_cond(carry))
-        result_code = jnp.where(converged, Result.CONVERGED, Result.MAX_STEPS)
+        result_code = jnp.where(
+            jnp.logical_not(_tree_allfinite(x)),
+            Result.DIVERGED,
+            jnp.where(_above_tols(aerr, rerr), Result.MAX_STEPS, Result.CONVERGED),
+        )
         stats = Stats(steps=step, abs_err=aerr, rel_err=rerr)
         solution = Solution(value=x, result=result_code, stats=stats, aux=aux)
 

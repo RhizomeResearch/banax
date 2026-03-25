@@ -168,6 +168,43 @@ sol = GDEQ(solver=Broyden(atol=1e-6, max_steps=100))((f, (W, b)), x0)
 x_star = sol.value
 ```
 
+### Dynamic step budget
+
+`max_steps` is a static field baked into the compiled JAX trace.
+Changing it between calls triggers a recompile.
+
+For strategies that vary the iteration depth at runtime,
+such as progressive deepening, randomized step counts, curriculum schedules,
+pass `step_budget` to the adjoint call instead:
+
+```python
+solver = Picard(atol=1e-6, max_steps=100)   # max_steps: compile-time ceiling
+adjoint = JFB(solver=solver)
+
+sol = adjoint((f, (W, b)), x0, step_budget=jnp.array(10))
+sol = adjoint((f, (W, b)), x0, step_budget=jnp.array(50))
+```
+
+To avoid recompilation when varying the budget,
+pass it as a JAX array inside a JIT-compiled function
+so JAX traces it as an abstract value:
+
+```python
+@eqx.filter_jit
+def train_step(model, x0, budget):
+    sol = adjoint((model, ()), x0, step_budget=budget)
+    return loss(sol.value)
+
+train_step(model, x0, jnp.array(10))  # compiles once
+train_step(model, x0, jnp.array(50))  # reuses compiled code
+```
+
+`step_budget` only accepts a JAX array (or `None`);
+passing a plain Python `int` is a type error.
+`max_steps` remains the hard ceiling:
+a `step_budget` larger than `max_steps`
+is silently clamped to `max_steps`.
+
 ### Auxiliary state
 
 Pass `aux_update` and `aux_init` to accumulate state across iterations.
