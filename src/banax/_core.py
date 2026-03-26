@@ -111,14 +111,15 @@ class Solution(eqx.Module):
         result: :attr:`Result.CONVERGED` or :attr:`Result.MAX_STEPS` as an
             ``Int[Array, ""]``.
         stats: Convergence statistics; see :class:`Stats`.
-        aux: Accumulated auxiliary state from ``aux_update``, or ``None``
-            when no ``aux_update`` was provided.
+        trace: Result of the trace fold, or ``None`` when no ``trace``
+            was provided.  The trace function is called at every ``f``
+            evaluation inside the solver, including ``init()``.
     """
 
     value: T
-    result: Step  # Result.CONVERGED or Result.MAX_STEPS as Int[Array, ""]
+    result: Step  # Result.CONVERGED, Result.MAX_STEPS, or Result.DIVERGED
     stats: Stats
-    aux: PyTree | None
+    trace: PyTree | None
 
 
 def _normalize_f_spec(f_spec):

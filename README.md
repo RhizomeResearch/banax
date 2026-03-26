@@ -205,27 +205,65 @@ passing a plain Python `int` is a type error.
 a `step_budget` larger than `max_steps`
 is silently clamped to `max_steps`.
 
-### Auxiliary state
+### Function auxiliary output
 
-Pass `aux_update` and `aux_init` to accumulate state across iterations.
-The result is returned in `sol.aux`.
+If `f` returns a `(fx, f_aux)` pair alongside the fixed-point iterate,
+pass `has_aux=True`:
 
 ```python
-max_steps = 50
+def f(x, W, b):
+    pre = W @ x + b
+    return jnp.tanh(pre), {"pre_activations": pre}   # (fx, f_aux)
 
-# aux is a (max_steps, 64) array; each iteration writes x into the next row
-def record_iterates(step, aux, x, fx, state):
-    return aux.at[step].set(x)
+sol = adjoint((f, (W, b)), x0, has_aux=True)
+x_star = sol.value   # fixed point; f_aux is discarded unless trace is also provided
+```
+
+### Tracing f evaluations
+
+Pass `trace=(trace_fn, trace_init)`
+to fold over every `f` evaluation inside the solver,
+including those inside `init()` and any line-search sub-steps.
+The result is returned in `sol.trace`.
+
+```python
+# Count total f evaluations (init + every step)
+def count_evals(acc, x, fx, f_aux):
+    return acc + 1
 
 sol = adjoint(
     (f, (W, b)), x0,
-    aux_update=record_iterates,
-    aux_init=jnp.zeros((max_steps, 64)),
+    trace=(count_evals, jnp.array(0)),
 )
-
-# sol.aux[n_steps:] are the unused rows (still zeros)
-trajectory = sol.aux[:sol.stats.steps]
+print(sol.trace)   # >= sol.stats.steps (init also calls f)
 ```
+
+The trace function signature is `(acc, x, fx, f_aux) -> acc`.
+`f_aux` is `None` unless `has_aux=True` is also passed.
+
+When both are combined,
+the trace receives the auxiliary output of each `f` call directly:
+
+```python
+def f(x, W, b):
+    pre = W @ x + b
+    return jnp.tanh(pre), {"pre_activations": pre}
+
+def keep_last(acc, x, fx, f_aux):
+    return f_aux   # keep most-recent f_aux
+
+sol = adjoint(
+    (f, (W, b)), x0,
+    has_aux=True,
+    trace=(keep_last, None),
+)
+sol.trace["pre_activations"]   # pre-activations at the final iterate
+```
+
+Some solvers may pass additional keyword arguments to the trace function
+(e.g. `Broyden` with `ls_steps > 0` passes `tag="line_search"`
+at line-search call sites).
+If you use such a solver, accept `**kwargs` in your trace function.
 
 ## Regularization
 

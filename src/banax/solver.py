@@ -76,23 +76,34 @@ class Solver[Z, S](eqx.Module):
     loop_kind: EquinoxLoopKind = eqx.field(static=True, default="lax", kw_only=True)
 
     @abstractmethod
-    def init(self, f: Fn[Z], x0: Z) -> S: ...
+    def init(
+        self, f: Fn[Z], x0: Z, *, trace_fn=None, trace_acc=None
+    ) -> tuple[S, PyTree | None]: ...
 
     @abstractmethod
-    def step(self, f: Fn[Z], x: Z, state: S) -> tuple[Z, Z, S]: ...
+    def step(
+        self, f: Fn[Z], x: Z, state: S, *, trace_fn=None, trace_acc=None
+    ) -> tuple[Z, Z, S, PyTree | None]: ...
 
     def _solve(
         self,
         f_spec: FSpec[Z],
         x0: Z,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> tuple[Solution, S]:
         """Run the fixed-point loop.
 
         Args:
+            has_aux: If ``True``, ``f`` is expected to return ``(fx, f_aux)``
+                instead of plain ``fx``. The ``f_aux`` is passed to the trace
+                function (if provided) at every ``f`` evaluation.
+            trace: Optional ``(trace_fn, trace_init)`` pair.
+                ``trace_fn(acc, x, fx, f_aux) -> acc`` is called at every
+                ``f`` evaluation inside the solver, including ``init()``.
+                The final accumulator is stored in ``Solution.trace``.
             step_budget: Optional runtime cap on the number of iterations.
                 Pass a JAX array (e.g. ``jnp.array(n)``) as a JIT argument
                 so it is traced as an abstract value — varying it between calls
@@ -104,8 +115,21 @@ class Solver[Z, S](eqx.Module):
 
         f, f_args, f_kwargs = _normalize_f_spec(f_spec)
 
-        def _f(_x):
-            return f(_x, *f_args, **f_kwargs)
+        # Wrap f to always return (fx, f_aux)
+        if has_aux:
+
+            def _f(_x):
+                return f(_x, *f_args, **f_kwargs)
+        else:
+
+            def _f(_x):
+                return f(_x, *f_args, **f_kwargs), None
+
+        # Unpack trace
+        if trace is not None:
+            trace_fn, trace_init = trace
+        else:
+            trace_fn, trace_init = None, None
 
         def _above_tols(_aerr, _rerr) -> Bool[Array, ""] | bool:
             """True when all active tolerance criteria are unsatisfied."""
@@ -126,39 +150,38 @@ class Solver[Z, S](eqx.Module):
             return jnp.logical_and(running, step < step_budget)
 
         def _loop_body(_carry: Carry) -> Carry:
-            (x, step, aerr, rerr, aux), solver_state = _carry
-            x_next, fx_next, solver_state_next = self.step(_f, x, solver_state)
-            aux_next = (
-                aux_update(step, aux, x_next, fx_next, solver_state_next)
-                if aux_update is not None
-                else None
+            (x, step, aerr, rerr, trace_acc), solver_state = _carry
+            x_next, fx_next, solver_state_next, trace_acc_next = self.step(
+                _f, x, solver_state, trace_fn=trace_fn, trace_acc=trace_acc
             )
 
             aerr = _abs_err(x_next, fx_next) if self.atol > 0.0 else jnp.array(0.0)
             rerr = _rel_err(x_next, fx_next) if self.rtol > 0.0 else jnp.array(0.0)
             step += 1
 
-            return (x_next, step, aerr, rerr, aux_next), solver_state_next
+            return (x_next, step, aerr, rerr, trace_acc_next), solver_state_next
 
-        solver_state_init = self.init(_f, x0)
+        solver_state_init, trace_acc = self.init(
+            _f, x0, trace_fn=trace_fn, trace_acc=trace_init
+        )
         step = jnp.array(0)
         aerr = jnp.array(2 * self.atol)
         rerr = jnp.array(2 * self.rtol)
 
-        carry = ((x0, step, aerr, rerr, aux_init), solver_state_init)
+        carry = ((x0, step, aerr, rerr, trace_acc), solver_state_init)
 
         carry = eqxi.while_loop(
             _loop_cond, _loop_body, carry, max_steps=self.max_steps, kind=self.loop_kind
         )
 
-        (x, step, aerr, rerr, aux), solver_state = carry
+        (x, step, aerr, rerr, trace_acc), solver_state = carry
         result_code = jnp.where(
             jnp.logical_not(_tree_allfinite(x)),
             Result.DIVERGED,
             jnp.where(_above_tols(aerr, rerr), Result.MAX_STEPS, Result.CONVERGED),
         )
         stats = Stats(steps=step, abs_err=aerr, rel_err=rerr)
-        solution = Solution(value=x, result=result_code, stats=stats, aux=aux)
+        solution = Solution(value=x, result=result_code, stats=stats, trace=trace_acc)
 
         return solution, solver_state
 
@@ -173,13 +196,22 @@ class Picard[Z: T](Solver[Z, Z]):
 
     type State = Z
 
-    def init(self, f: Fn[Z], x0: Z) -> State:
-        return f(x0)
+    def init(
+        self, f: Fn[Z], x0: Z, *, trace_fn=None, trace_acc=None
+    ) -> tuple[State, PyTree | None]:
+        fx, f_aux = f(x0)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x0, fx, f_aux)
+        return fx, trace_acc
 
-    def step(self, f: Fn[Z], x: Z, state: State) -> tuple[Z, Z, State]:
+    def step(
+        self, f: Fn[Z], x: Z, state: State, *, trace_fn=None, trace_acc=None
+    ) -> tuple[Z, Z, State, PyTree | None]:
         x_next = state
-        fx_next = f(x_next)
-        return x_next, fx_next, fx_next
+        fx_next, f_aux = f(x_next)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x_next, fx_next, f_aux)
+        return x_next, fx_next, fx_next, trace_acc
 
 
 class Relaxed[Z: T](Solver[Z, Z]):
@@ -203,14 +235,23 @@ class Relaxed[Z: T](Solver[Z, Z]):
     type State = Z
     damp: float = eqx.field(static=True, default=0.8, kw_only=True)
 
-    def init(self, f: Fn[Z], x0: Z) -> State:
-        return f(x0)
+    def init(
+        self, f: Fn[Z], x0: Z, *, trace_fn=None, trace_acc=None
+    ) -> tuple[State, PyTree | None]:
+        fx, f_aux = f(x0)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x0, fx, f_aux)
+        return fx, trace_acc
 
-    def step(self, f: Fn[Z], x: Z, state: State) -> tuple[Z, Z, State]:
+    def step(
+        self, f: Fn[Z], x: Z, state: State, *, trace_fn=None, trace_acc=None
+    ) -> tuple[Z, Z, State, PyTree | None]:
         f_x = state
         x_next = ((1 - self.damp) * x**ω + self.damp * f_x**ω).ω
-        fx_next = f(x_next)
-        return x_next, fx_next, fx_next
+        fx_next, f_aux = f(x_next)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x_next, fx_next, f_aux)
+        return x_next, fx_next, fx_next, trace_acc
 
 
 class Reversible[Z: T](Solver[Z, tuple[Z, Z]]):
@@ -257,22 +298,44 @@ class Reversible[Z: T](Solver[Z, tuple[Z, Z]]):
     type State = tuple[Z, Z]
     damp: float = eqx.field(static=True, default=0.8, kw_only=True)
 
-    def init(self, f: Fn[Z], x0: Z) -> State:
-        return x0, f(x0)
+    def init(
+        self, f: Fn[Z], x0: Z, *, trace_fn=None, trace_acc=None
+    ) -> tuple[State, PyTree | None]:
+        fx, f_aux = f(x0)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x0, fx, f_aux)
+        return (x0, fx), trace_acc
 
-    def step(self, f: Fn[Z], x: Z, state: State) -> tuple[Z, Z, State]:
+    def step(
+        self, f: Fn[Z], x: Z, state: State, *, trace_fn=None, trace_acc=None
+    ) -> tuple[Z, Z, State, PyTree | None]:
         w, f_x = state
 
-        def _body(_f_carry, _a):
-            b = ((1 - self.damp) * _a**ω + self.damp * _f_carry**ω).ω
-            return f(b), b
+        if trace_fn is not None:
 
-        wx = jax.tree.map(lambda a, b: jnp.stack([a, b]), w, x)
-        fx_next, wx_next = jax.lax.scan(_body, f_x, wx)
+            def _body(_carry, _a):
+                f_val, acc = _carry
+                b = ((1 - self.damp) * _a**ω + self.damp * f_val**ω).ω
+                fb, f_aux = f(b)
+                acc = trace_fn(acc, b, fb, f_aux)
+                return (fb, acc), b
+
+            wx = jax.tree.map(lambda a, b: jnp.stack([a, b]), w, x)
+            (fx_next, trace_acc), wx_next = jax.lax.scan(_body, (f_x, trace_acc), wx)
+        else:
+
+            def _body(_carry, _a):
+                b = ((1 - self.damp) * _a**ω + self.damp * _carry**ω).ω
+                fb, _ = f(b)
+                return fb, b  # _f always returns (fx, None); unpack and discard
+
+            wx = jax.tree.map(lambda a, b: jnp.stack([a, b]), w, x)
+            fx_next, wx_next = jax.lax.scan(_body, f_x, wx)
+
         w_next = (wx_next**ω)[0].ω
         x_next = (wx_next**ω)[1].ω
 
-        return x_next, fx_next, (w_next, fx_next)
+        return x_next, fx_next, (w_next, fx_next), trace_acc
 
 
 class Broyden[Z: T](Solver[Z, tuple]):
@@ -302,17 +365,23 @@ class Broyden[Z: T](Solver[Z, tuple]):
     history_size: int = eqx.field(static=True, default=10, kw_only=True)
     ls_steps: int = eqx.field(static=True, default=0, kw_only=True)
 
-    def init(self, f: Fn[Z], x0: Z) -> State:
-        fx0 = f(x0)
+    def init(
+        self, f: Fn[Z], x0: Z, *, trace_fn=None, trace_acc=None
+    ) -> tuple[State, PyTree | None]:
+        fx0, f_aux = f(x0)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x0, fx0, f_aux)
         x_flat, _ = jax.flatten_util.ravel_pytree(x0)
         n = x_flat.shape[0]
         fx_flat, _ = jax.flatten_util.ravel_pytree(fx0)
         g_flat = fx_flat - x_flat
         U = jnp.zeros((self.history_size, n))
         V = jnp.zeros((self.history_size, n))
-        return fx0, g_flat, U, V, jnp.array(0)
+        return (fx0, g_flat, U, V, jnp.array(0)), trace_acc
 
-    def step(self, f: Fn[Z], x: Z, state: State) -> tuple[Z, Z, State]:
+    def step(
+        self, f: Fn[Z], x: Z, state: State, *, trace_fn=None, trace_acc=None
+    ) -> tuple[Z, Z, State, PyTree | None]:
         fx_prev, g_flat, U, V, idx = state
 
         x_flat, unflatten = jax.flatten_util.ravel_pytree(x)
@@ -327,43 +396,94 @@ class Broyden[Z: T](Solver[Z, tuple]):
             g_sq_curr = g_flat @ g_flat
 
             def _ls_cond(_carry):
-                _alpha, _x_next_flat, _fx_next, _g_sq_next = _carry
+                _alpha, _x_next_flat, _fx_next, _g_sq_next = _carry[:4]
                 return _g_sq_next > (1 - 2e-4 * _alpha) * g_sq_curr
 
-            def _ls_body(_carry):
-                _alpha, _, _, _ = _carry
-                _alpha_new = _alpha * 0.5
-                _x_trial_flat = x_flat + _alpha_new * dx
-                _fx_trial = f(unflatten(_x_trial_flat))
-                _fx_trial_flat, _ = jax.flatten_util.ravel_pytree(_fx_trial)
-                _g_trial_flat = _fx_trial_flat - _x_trial_flat
-                return (
-                    _alpha_new,
-                    _x_trial_flat,
-                    _fx_trial,
-                    _g_trial_flat @ _g_trial_flat,
-                )
-
+            # Initial trial at alpha=1
             x_next_flat_init = x_flat + dx
-            fx_next_init = f(unflatten(x_next_flat_init))
+            fx_next_init, fa_init = f(unflatten(x_next_flat_init))
+            if trace_fn is not None:
+                # tag="line_search" lets trace functions distinguish LS trials
+                # from main step evaluations. Trace functions used with
+                # Broyden(ls_steps>0) must accept **kwargs.
+                trace_acc = trace_fn(
+                    trace_acc,
+                    unflatten(x_next_flat_init),
+                    fx_next_init,
+                    fa_init,
+                    tag="line_search",
+                )
             fx_next_flat_init, _ = jax.flatten_util.ravel_pytree(fx_next_init)
             g_next_flat_init = fx_next_flat_init - x_next_flat_init
 
-            init_carry = (
-                jnp.array(1.0),
-                x_next_flat_init,
-                fx_next_init,
-                g_next_flat_init @ g_next_flat_init,
-            )
-            alpha, x_next_flat, fx_next, _ = eqxi.while_loop(
-                _ls_cond, _ls_body, init_carry, max_steps=self.ls_steps, kind="lax"
-            )
+            if trace_fn is not None:
+
+                def _ls_body(_carry):
+                    _alpha, _x_next_flat, _fx_next, _g_sq_next, _acc = _carry
+                    _alpha_new = _alpha * 0.5
+                    _x_trial_flat = x_flat + _alpha_new * dx
+                    _fx_trial, _fa = f(unflatten(_x_trial_flat))
+                    _acc = trace_fn(
+                        _acc,
+                        unflatten(_x_trial_flat),
+                        _fx_trial,
+                        _fa,
+                        tag="line_search",
+                    )
+                    _fx_trial_flat, _ = jax.flatten_util.ravel_pytree(_fx_trial)
+                    _g_trial_flat = _fx_trial_flat - _x_trial_flat
+                    return (
+                        _alpha_new,
+                        _x_trial_flat,
+                        _fx_trial,
+                        _g_trial_flat @ _g_trial_flat,
+                        _acc,
+                    )
+
+                init_carry = (
+                    jnp.array(1.0),
+                    x_next_flat_init,
+                    fx_next_init,
+                    g_next_flat_init @ g_next_flat_init,
+                    trace_acc,
+                )
+                alpha, x_next_flat, fx_next, _, trace_acc = eqxi.while_loop(
+                    _ls_cond, _ls_body, init_carry, max_steps=self.ls_steps, kind="lax"
+                )
+            else:
+
+                def _ls_body(_carry):
+                    _alpha, _, _, _ = _carry
+                    _alpha_new = _alpha * 0.5
+                    _x_trial_flat = x_flat + _alpha_new * dx
+                    _fx_trial, _ = f(unflatten(_x_trial_flat))
+                    _fx_trial_flat, _ = jax.flatten_util.ravel_pytree(_fx_trial)
+                    _g_trial_flat = _fx_trial_flat - _x_trial_flat
+                    return (
+                        _alpha_new,
+                        _x_trial_flat,
+                        _fx_trial,
+                        _g_trial_flat @ _g_trial_flat,
+                    )
+
+                init_carry = (
+                    jnp.array(1.0),
+                    x_next_flat_init,
+                    fx_next_init,
+                    g_next_flat_init @ g_next_flat_init,
+                )
+                alpha, x_next_flat, fx_next, _ = eqxi.while_loop(
+                    _ls_cond, _ls_body, init_carry, max_steps=self.ls_steps, kind="lax"
+                )
+
             dx = alpha * dx
             x_next = unflatten(x_next_flat)
         else:
             x_next_flat = x_flat + dx
             x_next = unflatten(x_next_flat)
-            fx_next = f(x_next)
+            fx_next, f_aux = f(x_next)
+            if trace_fn is not None:
+                trace_acc = trace_fn(trace_acc, x_next, fx_next, f_aux)
 
         # Good Broyden (Type-I) rank-1 update
         fx_next_flat, _ = jax.flatten_util.ravel_pytree(fx_next)
@@ -387,7 +507,7 @@ class Broyden[Z: T](Solver[Z, tuple]):
         U = U.at[slot].set(u_new)
         V = V.at[slot].set(vT)
 
-        return x_next, fx_next, (fx_next, g_next_flat, U, V, idx + 1)
+        return x_next, fx_next, (fx_next, g_next_flat, U, V, idx + 1), trace_acc
 
 
 def _cholesky_solve(A, b, n):
@@ -453,8 +573,12 @@ class Anderson[Z: T](Solver[Z, tuple]):
     ridge: float = eqx.field(static=True, default=1e-6, kw_only=True)
     use_linalg: bool = eqx.field(static=True, default=True, kw_only=True)
 
-    def init(self, f: Fn[Z], x0: Z) -> State:
-        fx0 = f(x0)
+    def init(
+        self, f: Fn[Z], x0: Z, *, trace_fn=None, trace_acc=None
+    ) -> tuple[State, PyTree | None]:
+        fx0, f_aux = f(x0)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x0, fx0, f_aux)
         x_flat, _ = jax.flatten_util.ravel_pytree(x0)
         n = x_flat.shape[0]
         fx_flat, _ = jax.flatten_util.ravel_pytree(fx0)
@@ -463,9 +587,11 @@ class Anderson[Z: T](Solver[Z, tuple]):
         G_hist = jnp.zeros((self.depth, n))
         X_hist = X_hist.at[0].set(x_flat)
         G_hist = G_hist.at[0].set(g_flat)
-        return fx0, g_flat, X_hist, G_hist, jnp.array(1)
+        return (fx0, g_flat, X_hist, G_hist, jnp.array(1)), trace_acc
 
-    def step(self, f: Fn[Z], x: Z, state: State) -> tuple[Z, Z, State]:
+    def step(
+        self, f: Fn[Z], x: Z, state: State, *, trace_fn=None, trace_acc=None
+    ) -> tuple[Z, Z, State, PyTree | None]:
         fx_prev, g_flat, X_hist, G_hist, idx = state
 
         x_flat, unflatten = jax.flatten_util.ravel_pytree(x)
@@ -496,7 +622,9 @@ class Anderson[Z: T](Solver[Z, tuple]):
         x_next_flat = x_flat + self.damp * g_flat - (DX + self.damp * DG).T @ gamma
 
         x_next = unflatten(x_next_flat)
-        fx_next = f(x_next)
+        fx_next, f_aux = f(x_next)
+        if trace_fn is not None:
+            trace_acc = trace_fn(trace_acc, x_next, fx_next, f_aux)
 
         # Update ring buffer
         fx_next_flat, _ = jax.flatten_util.ravel_pytree(fx_next)
@@ -504,4 +632,9 @@ class Anderson[Z: T](Solver[Z, tuple]):
         X_hist = X_hist.at[cur].set(x_next_flat)
         G_hist = G_hist.at[cur].set(g_next_flat)
 
-        return x_next, fx_next, (fx_next, g_next_flat, X_hist, G_hist, idx + 1)
+        return (
+            x_next,
+            fx_next,
+            (fx_next, g_next_flat, X_hist, G_hist, idx + 1),
+            trace_acc,
+        )

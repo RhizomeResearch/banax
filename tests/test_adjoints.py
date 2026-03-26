@@ -1,6 +1,6 @@
 """Adjoint tests: primal correctness and gradient correctness.
 
-Solver internals (norms, convergence, aux) belong in test_solvers.py.
+Solver internals (norms, convergence, trace) belong in test_solvers.py.
 """
 
 import jax

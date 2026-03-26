@@ -35,7 +35,8 @@ class Adjoint(eqx.Module):
     Calling an adjoint::
 
         sol = adjoint(f_spec, x0)
-        sol = adjoint(f_spec, x0, aux_update=fn, aux_init=init)
+        sol = adjoint(f_spec, x0, has_aux=True)
+        sol = adjoint(f_spec, x0, trace=(trace_fn, trace_init))
 
     Args:
         f_spec: The fixed-point function;
@@ -43,10 +44,15 @@ class Adjoint(eqx.Module):
         x0: Initial iterate.
             Must have the same pytree structure and array shapes
             as the output of ``f``.
-        aux_update: Optional callable ``(step, aux, x, fx, state) → aux``
-            called at each iteration to accumulate auxiliary state.
-        aux_init: Initial value for ``aux``;
-            required when ``aux_update`` is provided.
+        has_aux: If ``True``, ``f`` returns ``(fx, f_aux)`` rather than
+            just ``fx``. The auxiliary output is threaded through the solver
+            but does not affect the fixed-point iteration.
+        trace: Optional ``(trace_fn, trace_init)`` pair.
+            ``trace_fn(acc, x, fx, f_aux) → acc``
+            is called at every ``f`` evaluation inside the solver (including ``init()``),
+            with ``trace_init`` as the initial accumulator.
+            ``f_aux`` is ``None`` unless ``has_aux=True`` is also passed.
+            The final accumulator is stored in :attr:`~banax._core.Solution.trace`.
 
     Returns:
         A :class:`~banax._core.Solution`
@@ -58,20 +64,23 @@ class Adjoint(eqx.Module):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         f, f_args, f_kwargs = _normalize_f_spec(f_spec)
-        out_struct = jax.eval_shape(lambda: f(x0, *f_args, **f_kwargs))
+        if has_aux:
+            out_struct, _ = jax.eval_shape(lambda: f(x0, *f_args, **f_kwargs))
+        else:
+            out_struct = jax.eval_shape(lambda: f(x0, *f_args, **f_kwargs))
         in_struct = jax.eval_shape(lambda: x0)
         if eqx.tree_equal(in_struct, out_struct) is not True:
             raise ValueError("f_spec must produce output with same structure as x0")
         return self._loop(
             f_spec,
             x0,
-            aux_update=aux_update,
-            aux_init=aux_init,
+            has_aux=has_aux,
+            trace=trace,
             step_budget=step_budget,
         )
 
@@ -81,8 +90,8 @@ class Adjoint(eqx.Module):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution: ...
 
@@ -122,15 +131,15 @@ class BPTT(Adjoint):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         solution, _ = self.solver._solve(
             f_spec,
             x0,
-            aux_update=aux_update,
-            aux_init=aux_init,
+            has_aux=has_aux,
+            trace=trace,
             step_budget=step_budget,
         )
         return solution
@@ -138,14 +147,14 @@ class BPTT(Adjoint):
 
 @eqx.filter_custom_vjp
 def _implicit(
-    grad_arg, x0, solver, b_solver, aux_update=None, aux_init=None, step_budget=None
+    grad_arg, x0, solver, b_solver, has_aux=False, trace=None, step_budget=None
 ):
     del b_solver
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
     return solution
@@ -158,8 +167,8 @@ def _implicit_fwd(
     x0,
     solver,
     b_solver,
-    aux_update=None,
-    aux_init=None,
+    has_aux=False,
+    trace=None,
     step_budget=None,
 ):
     del perturbed, b_solver
@@ -167,8 +176,8 @@ def _implicit_fwd(
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
 
@@ -184,11 +193,11 @@ def _implicit_bwd(
     x0,
     solver,
     b_solver,
-    aux_update,
-    aux_init,
+    has_aux,
+    trace,
     step_budget,
 ):
-    del perturbed, x0, solver, aux_update, aux_init, step_budget
+    del perturbed, x0, solver, has_aux, trace, step_budget
     f, f_args, f_kwargs = grad_arg
     x_star = residuals
     grad_x = gradients.value
@@ -245,23 +254,23 @@ class Implicit(Adjoint):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         grad_arg = _normalize_f_spec(f_spec)
         return _implicit(
-            grad_arg, x0, self.solver, self.b_solver, aux_update, aux_init, step_budget
+            grad_arg, x0, self.solver, self.b_solver, has_aux, trace, step_budget
         )
 
 
 @eqx.filter_custom_vjp
-def _jfb(grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None):
+def _jfb(grad_arg, x0, solver, has_aux=False, trace=None, step_budget=None):
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
     return solution
@@ -269,15 +278,15 @@ def _jfb(grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None)
 
 @_jfb.def_fwd
 def _jfb_fwd(
-    perturbed, grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None
+    perturbed, grad_arg, x0, solver, has_aux=False, trace=None, step_budget=None
 ):
     del perturbed
 
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
 
@@ -292,11 +301,11 @@ def _jfb_bwd(
     grad_arg,
     x0,
     solver,
-    aux_update,
-    aux_init,
+    has_aux,
+    trace,
     step_budget,
 ):
-    del perturbed, x0, solver, aux_update, aux_init, step_budget
+    del perturbed, x0, solver, has_aux, trace, step_budget
     f, f_args, f_kwargs = grad_arg
     x_star = residuals
     grad_x = gradients.value
@@ -336,24 +345,24 @@ class JFB(Adjoint):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         grad_arg = _normalize_f_spec(f_spec)
-        return _jfb(grad_arg, x0, self.solver, aux_update, aux_init, step_budget)
+        return _jfb(grad_arg, x0, self.solver, has_aux, trace, step_budget)
 
 
 @eqx.filter_custom_vjp
 def _unroll_phantom(
-    grad_arg, x0, solver, b_solver, aux_update=None, aux_init=None, step_budget=None
+    grad_arg, x0, solver, b_solver, has_aux=False, trace=None, step_budget=None
 ):
     del b_solver
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
     return solution
@@ -366,8 +375,8 @@ def _unroll_phantom_fwd(
     x0,
     solver,
     b_solver,
-    aux_update=None,
-    aux_init=None,
+    has_aux=False,
+    trace=None,
     step_budget=None,
 ):
     del perturbed, b_solver
@@ -375,8 +384,8 @@ def _unroll_phantom_fwd(
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
 
@@ -392,11 +401,11 @@ def _unroll_phantom_bwd(
     x0,
     solver,
     b_solver,
-    aux_update,
-    aux_init,
+    has_aux,
+    trace,
     step_budget,
 ):
-    del perturbed, x0, solver, aux_update, aux_init, step_budget
+    del perturbed, x0, solver, has_aux, trace, step_budget
     f, f_args, f_kwargs = grad_arg
     x_star = residuals
     grad_x = gradients.value
@@ -445,26 +454,26 @@ class UnrollPhantom(Adjoint):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         grad_arg = _normalize_f_spec(f_spec)
         return _unroll_phantom(
-            grad_arg, x0, self.solver, self.b_solver, aux_update, aux_init, step_budget
+            grad_arg, x0, self.solver, self.b_solver, has_aux, trace, step_budget
         )
 
 
 @eqx.filter_custom_vjp
 def _neumann(
-    grad_arg, x0, solver, b_solver, aux_update=None, aux_init=None, step_budget=None
+    grad_arg, x0, solver, b_solver, has_aux=False, trace=None, step_budget=None
 ):
     del b_solver
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
     return solution
@@ -477,16 +486,16 @@ def _neumann_fwd(
     x0,
     solver,
     b_solver,
-    aux_update=None,
-    aux_init=None,
+    has_aux=False,
+    trace=None,
     step_budget=None,
 ):
     del perturbed, b_solver
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
 
@@ -502,11 +511,11 @@ def _neumann_bwd(
     x0,
     solver,
     b_solver,
-    aux_update,
-    aux_init,
+    has_aux,
+    trace,
     step_budget,
 ):
-    del perturbed, x0, solver, aux_update, aux_init, step_budget
+    del perturbed, x0, solver, has_aux, trace, step_budget
     x_star, n_steps = residuals
     grad_x = gradients.value
     f, f_args, f_kwargs = grad_arg
@@ -567,23 +576,23 @@ class NeumannPhantom(Adjoint):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         grad_arg = _normalize_f_spec(f_spec)
         return _neumann(
-            grad_arg, x0, self.solver, self.b_solver, aux_update, aux_init, step_budget
+            grad_arg, x0, self.solver, self.b_solver, has_aux, trace, step_budget
         )
 
 
 @eqx.filter_custom_vjp
-def _rev(grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None):
+def _rev(grad_arg, x0, solver, has_aux=False, trace=None, step_budget=None):
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
     return solution
@@ -591,15 +600,15 @@ def _rev(grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None)
 
 @_rev.def_fwd
 def _rev_fwd(
-    perturbed, grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None
+    perturbed, grad_arg, x0, solver, has_aux=False, trace=None, step_budget=None
 ):
     del perturbed
 
     solution, solver_state = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
 
@@ -616,11 +625,11 @@ def _rev_bwd(
     grad_arg,
     x0,
     solver,
-    aux_update,
-    aux_init,
+    has_aux,
+    trace,
     step_budget,
 ):
-    del perturbed, x0, aux_update, aux_init, step_budget
+    del perturbed, x0, has_aux, trace, step_budget
     f, f_args, f_kwargs = grad_arg
     damp = solver.damp
 
@@ -740,21 +749,21 @@ class Reversible(Adjoint):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         grad_arg = _normalize_f_spec(f_spec)
-        return _rev(grad_arg, x0, self.solver, aux_update, aux_init, step_budget)
+        return _rev(grad_arg, x0, self.solver, has_aux, trace, step_budget)
 
 
 @eqx.filter_custom_vjp
-def _gdeq(grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None):
+def _gdeq(grad_arg, x0, solver, has_aux=False, trace=None, step_budget=None):
     solution, _ = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
     return solution
@@ -762,15 +771,15 @@ def _gdeq(grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None
 
 @_gdeq.def_fwd
 def _gdeq_fwd(
-    perturbed, grad_arg, x0, solver, aux_update=None, aux_init=None, step_budget=None
+    perturbed, grad_arg, x0, solver, has_aux=False, trace=None, step_budget=None
 ):
     del perturbed
 
     solution, solver_state = solver._solve(
         grad_arg,
         x0=x0,
-        aux_update=aux_update,
-        aux_init=aux_init,
+        has_aux=has_aux,
+        trace=trace,
         step_budget=step_budget,
     )
     _, _, U, V, idx = solver_state  # Broyden state: (fx, g_flat, U, V, idx)
@@ -785,11 +794,11 @@ def _gdeq_bwd(
     grad_arg,
     x0,
     solver,
-    aux_update,
-    aux_init,
+    has_aux,
+    trace,
     step_budget,
 ):
-    del perturbed, x0, solver, aux_update, aux_init, step_budget
+    del perturbed, x0, solver, has_aux, trace, step_budget
     f, f_args, f_kwargs = grad_arg
     x_star, U, V, idx = residuals
     grad_x = gradients.value
@@ -841,9 +850,9 @@ class GDEQ(Adjoint):
         f_spec: FSpec[T],
         x0: T,
         *,
-        aux_update: Callable[..., PyTree] | None = None,
-        aux_init: PyTree | None = None,
+        has_aux: bool = False,
+        trace: tuple[Callable[..., PyTree], PyTree] | None = None,
         step_budget: Step | None = None,
     ) -> Solution:
         grad_arg = _normalize_f_spec(f_spec)
-        return _gdeq(grad_arg, x0, self.solver, aux_update, aux_init, step_budget)
+        return _gdeq(grad_arg, x0, self.solver, has_aux, trace, step_budget)

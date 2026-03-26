@@ -1,4 +1,4 @@
-"""Solver-internals tests: norms, convergence, per-solver primal, aux.
+"""Solver-internals tests: norms, convergence, per-solver primal, trace, has_aux.
 
 Gradient correctness belongs in test_adjoints.py.
 """
@@ -318,67 +318,116 @@ class TestConvergence:
         assert sol.stats.steps == max_s
 
 
-# ── TestAux ───────────────────────────────────────────────────────────────
+# ── TestTrace ─────────────────────────────────────────────────────────────
 
 
-class TestAux:
+class TestTrace:
     @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
-    def test_aux_tracks_last_iterate(self, make_adj):
-        def aux_update(step, aux, x, fx, state):
+    def test_trace_tracks_last_iterate(self, make_adj):
+        def trace_fn(acc, x, fx, f_aux):
             return x
 
         sol = make_adj()(
             (linear, (0.5, 1.0)),
             jnp.array(0.0),
-            aux_update=aux_update,
-            aux_init=jnp.array(0.0),
+            trace=(trace_fn, jnp.array(0.0)),
         )
-        # aux should hold last iterate, which is close to x*=2.0
-        assert jnp.isfinite(sol.aux)
-        assert sol.aux > 1.0  # converging toward 2.0
+        # trace holds the last x seen, which should be close to x*=2.0
+        assert jnp.isfinite(sol.trace)
+        assert sol.trace > 1.0  # converging toward 2.0
 
     @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
-    def test_aux_counts_steps(self, make_adj):
-        def aux_update(step, aux, x, fx, state):
-            return aux + 1
+    def test_trace_counts_f_evals(self, make_adj):
+        def trace_fn(acc, x, fx, f_aux):
+            return acc + 1
 
         sol = make_adj()(
             (linear, (0.5, 1.0)),
             jnp.array(0.0),
-            aux_update=aux_update,
-            aux_init=jnp.array(0),
+            trace=(trace_fn, jnp.array(0)),
         )
-        assert jnp.array_equal(sol.aux, sol.stats.steps)
+        # trace counts every f call (including init), so >= number of steps
+        assert sol.trace >= sol.stats.steps
 
     @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
-    def test_aux_pytree(self, make_adj):
-        def aux_update(step, aux, x, fx, state):
-            return {"last_x": x, "count": aux["count"] + 1}
+    def test_trace_pytree(self, make_adj):
+        def trace_fn(acc, x, fx, f_aux):
+            return {"last_x": x, "count": acc["count"] + 1}
 
-        aux_init = {"last_x": jnp.array(0.0), "count": jnp.array(0)}
+        trace_init = {"last_x": jnp.array(0.0), "count": jnp.array(0)}
         sol = make_adj()(
             (linear, (0.5, 1.0)),
             jnp.array(0.0),
-            aux_update=aux_update,
-            aux_init=aux_init,
+            trace=(trace_fn, trace_init),
         )
-        assert jnp.isfinite(sol.aux["last_x"])
-        assert sol.aux["count"] > 0
+        assert jnp.isfinite(sol.trace["last_x"])
+        assert sol.trace["count"] > 0
 
     @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
-    def test_no_aux_is_none(self, make_adj):
+    def test_no_trace_is_none(self, make_adj):
         sol = make_adj()((linear, (0.5, 1.0)), jnp.array(0.0))
-        assert sol.aux is None
+        assert sol.trace is None
 
     @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
-    def test_aux_provided_is_not_none(self, make_adj):
+    def test_trace_provided_is_not_none(self, make_adj):
         sol = make_adj()(
             (linear, (0.5, 1.0)),
             jnp.array(0.0),
-            aux_update=lambda step, aux, x, fx, state: x,
-            aux_init=jnp.array(0.0),
+            trace=(lambda acc, x, fx, f_aux: x, jnp.array(0.0)),
         )
-        assert sol.aux is not None
+        assert sol.trace is not None
+
+
+# ── TestHasAux ────────────────────────────────────────────────────────────
+
+
+class TestHasAux:
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_has_aux_primal_correct(self, make_adj):
+        """f returns (fx, aux_data); solver should still find the fixed point."""
+
+        def f_with_aux(x, a, b):
+            return a * x + b, {"norm": jnp.abs(x)}
+
+        sol = make_adj()(
+            (f_with_aux, (0.5, 1.0)),
+            jnp.array(0.0),
+            has_aux=True,
+        )
+        assert jnp.allclose(sol.value, 2.0, atol=0.01)
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_has_aux_with_trace(self, make_adj):
+        """trace_fn receives non-None f_aux when has_aux=True."""
+
+        def f_with_aux(x, a, b):
+            return a * x + b, jnp.abs(x)
+
+        def trace_fn(acc, x, fx, f_aux):
+            return f_aux
+
+        sol = make_adj()(
+            (f_with_aux, (0.5, 1.0)),
+            jnp.array(0.0),
+            has_aux=True,
+            trace=(trace_fn, jnp.array(0.0)),
+        )
+        assert sol.trace is not None
+        assert jnp.isfinite(sol.trace)
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_has_aux_without_trace(self, make_adj):
+        """has_aux=True without trace → sol.trace is None."""
+
+        def f_with_aux(x, a, b):
+            return a * x + b, jnp.abs(x)
+
+        sol = make_adj()(
+            (f_with_aux, (0.5, 1.0)),
+            jnp.array(0.0),
+            has_aux=True,
+        )
+        assert sol.trace is None
 
 
 # ── TestSolution ──────────────────────────────────────────────────────────
@@ -390,7 +439,7 @@ class TestSolution:
         assert hasattr(sol, "value")
         assert hasattr(sol, "result")
         assert hasattr(sol, "stats")
-        assert hasattr(sol, "aux")
+        assert hasattr(sol, "trace")
         assert hasattr(sol.stats, "steps")
         assert hasattr(sol.stats, "abs_err")
         assert hasattr(sol.stats, "rel_err")
