@@ -24,7 +24,7 @@ MAX_STEPS = 200
 # (damp=0.8 at 5 steps: primal error ~0.044, gradient error ~1.2, cliff at step 10.)
 REV_DAMP = 0.5
 REV_MAX_STEPS = 20
-KEY = jax.random.PRNGKey(0)
+KEY = jax.random.key(0)
 
 # ── Test functions ─────────────────────────────────────────────────────────
 

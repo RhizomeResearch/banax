@@ -26,6 +26,7 @@ banax/
   solver.py         — iterative fixed-point solvers (Picard, Relaxed, Reversible, Broyden, Anderson)
   adjoint.py        — adjoint / differentiation methods (BPTT, JFB, Implicit, …)
   regularization.py — Jacobian regularization utilities
+  utils.py          — trace helpers and PyTree utilities
   _core.py          — shared types (T, FSpec, …)
 ```
 
@@ -240,30 +241,74 @@ print(sol.trace)   # >= sol.stats.steps (init also calls f)
 
 The trace function signature is `(acc, x, fx, f_aux) -> acc`.
 `f_aux` is `None` unless `has_aux=True` is also passed.
+`trace_init` must be a JAX value with the same PyTree structure and shapes
+as the output of `trace_fn` — it enters the solver's `while_loop` carry,
+which has a statically fixed structure.
 
-When both are combined,
-the trace receives the auxiliary output of each `f` call directly:
+### Trace helpers
+
+`banax.utils` provides ready-made trace specs for common patterns:
 
 ```python
+from banax import trace_last, trace_last_aux, trace_history, trace_count
+
+# Last value of any projection over (x, fx, f_aux)
+sol = adjoint((f, (W, b)), x0,
+    trace=trace_last(lambda x, fx, f_aux: fx, jnp.zeros(64)))
+sol.trace   # fx at the final evaluation
+
+# Last f_aux (shorthand for the above when has_aux=True)
 def f(x, W, b):
     pre = W @ x + b
     return jnp.tanh(pre), {"pre_activations": pre}
 
-def keep_last(acc, x, fx, f_aux):
-    return f_aux   # keep most-recent f_aux
-
-sol = adjoint(
-    (f, (W, b)), x0,
-    has_aux=True,
-    trace=(keep_last, None),
-)
+sol = adjoint((f, (W, b)), x0, has_aux=True,
+    trace=trace_last_aux({"pre_activations": jnp.zeros(64)}))
 sol.trace["pre_activations"]   # pre-activations at the final iterate
+
+# History buffer: collect a scalar at every evaluation
+sol = adjoint((f, (W, b)), x0,
+    trace=trace_history(lambda x, fx, f_aux: jnp.linalg.norm(fx - x),
+                        n_evals=solver.max_steps + 1,
+                        init_value=0.0))
+count, residuals = sol.trace   # residuals[i] is the value at evaluation i
+
+# Count total f evaluations
+sol = adjoint((f, (W, b)), x0, trace=trace_count())
+sol.trace   # scalar int: total calls including init() and line-search sub-steps
 ```
+
+`trace_history` returns `(count, buffer)` in `sol.trace`.
+`buffer` has shape `(n_evals, *value_shape)`;
+entries at indices `>= count` are zero-padded.
+Set `n_evals` to at least `solver.max_steps + 1`.
+For `Broyden` with `ls_steps > 0`,
+budget additional slots for line-search sub-steps.
 
 Some solvers may pass additional keyword arguments to the trace function
 (e.g. `Broyden` with `ls_steps > 0` passes `tag="line_search"`
 at line-search call sites).
 If you use such a solver, accept `**kwargs` in your trace function.
+
+
+# PyTree utilities
+
+`banax.utils` also provides PyTree-aware analogues of common JAX array functions:
+
+```python
+from banax import zeros_like, half_normal_like
+import jax
+
+# Zero-valued PyTree with the same structure, shapes, and dtypes
+x0 = zeros_like(model_state)
+
+# Random PyTree with ~half the elements zero, the rest i.i.d. standard normal
+key = jax.random.key(0)
+x0 = half_normal_like(key, model_state)
+```
+
+`zeros_like` and `half_normal_like` accept any JAX PyTree,
+not just plain arrays.
 
 ## Regularization
 

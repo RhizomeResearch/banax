@@ -7,6 +7,14 @@ import jax.numpy as jnp
 import pytest
 
 from banax._core import Result
+from banax.utils import (
+    trace_last,
+    trace_last_aux,
+    trace_history,
+    trace_count,
+    zeros_like,
+    half_normal_like,
+)
 from banax.solver import _abs_err, _rel_err
 from banax.solver import (
     Picard,
@@ -519,3 +527,136 @@ class TestStepBudget:
             jnp.array(7)
         )
         assert int(sol.stats.steps) <= 7
+
+
+# ── TestTraceHelpers ──────────────────────────────────────────────────────
+
+
+class TestTraceHelpers:
+    """Tests for the trace_* helper functions in banax.utils."""
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_trace_last_captures_final_value(self, make_adj):
+        # Track the last fx value; for x* = 2.0, fx at convergence ≈ 2.0
+        sol = make_adj()(
+            (linear, (0.5, 1.0)),
+            jnp.array(0.0),
+            trace=trace_last(lambda x, fx, f_aux: fx, jnp.array(0.0)),
+        )
+        assert jnp.isfinite(sol.trace)
+        assert jnp.allclose(sol.trace, 2.0, atol=0.05)
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_trace_last_aux_captures_final_aux(self, make_adj):
+        def f_with_aux(x, a, b):
+            return a * x + b, jnp.abs(x)
+
+        sol = make_adj()(
+            (f_with_aux, (0.5, 1.0)),
+            jnp.array(0.0),
+            has_aux=True,
+            trace=trace_last_aux(jnp.array(0.0)),
+        )
+        assert jnp.isfinite(sol.trace)
+        # At x* = 2.0, |x| ≈ 2.0
+        assert jnp.allclose(sol.trace, 2.0, atol=0.05)
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_trace_history_records_all_evals(self, make_adj):
+        n = MAX_STEPS + 1
+        sol = make_adj()(
+            (linear, (0.5, 1.0)),
+            jnp.array(0.0),
+            trace=trace_history(lambda x, fx, f_aux: x, n, 0.0),
+        )
+        count, buf = sol.trace
+        assert buf.shape == (n,)
+        # count includes the init() call, so count >= steps + 1
+        assert count >= sol.stats.steps + 1
+        # zero-padding begins at index count
+        assert jnp.all(buf[int(count) :] == 0.0)
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_trace_history_non_scalar(self, make_adj):
+        # 2-element x; track full x at each eval
+        def f_vec(x, a, b):
+            return a * x + b
+
+        x0 = jnp.array([0.0, 0.0])
+        n = MAX_STEPS + 1
+        sol = make_adj()(
+            (f_vec, (0.5, jnp.array([1.0, 2.0]))),
+            x0,
+            trace=trace_history(lambda x, fx, f_aux: x, n, jnp.zeros(2)),
+        )
+        _, buf = sol.trace
+        assert buf.shape == (n, 2)
+
+    @pytest.mark.parametrize("make_adj", ALL_ADJOINTS, ids=ALL_ADJOINT_IDS)
+    def test_trace_count_vs_stats(self, make_adj):
+        sol = make_adj()(
+            (linear, (0.5, 1.0)),
+            jnp.array(0.0),
+            trace=trace_count(),
+        )
+        # trace_count includes init(), so must be > stats.steps
+        assert sol.trace > sol.stats.steps
+
+
+# ── TestPytreeHelpers ─────────────────────────────────────────────────────
+
+
+class TestPytreeHelpers:
+    def test_zeros_like_array(self):
+        x = jnp.array([1.0, 2.0, 3.0])
+        z = zeros_like(x)
+        assert z.shape == x.shape
+        assert z.dtype == x.dtype
+        assert jnp.all(z == 0.0)
+
+    def test_zeros_like_pytree(self):
+        tree = {"a": jnp.ones((2, 3)), "b": jnp.ones(4, dtype=jnp.float16)}
+        z = zeros_like(tree)
+        assert jnp.all(z["a"] == 0.0)
+        assert z["a"].shape == (2, 3)
+        assert jnp.all(z["b"] == 0.0)
+        assert z["b"].dtype == jnp.float16
+
+    def test_half_normal_like_shape_dtype(self):
+        import jax
+
+        key = jax.random.key(0)
+        x = jnp.ones((10, 10))
+        out = half_normal_like(key, x)
+        assert out.shape == x.shape
+        assert out.dtype == x.dtype
+
+    def test_half_normal_like_roughly_half_zero(self):
+        import jax
+
+        key = jax.random.key(42)
+        x = jnp.ones((1000,))
+        out = half_normal_like(key, x)
+        zero_frac = jnp.mean(out == 0.0)
+        # With 1000 elements and p=0.5, fraction should be near 0.5
+        assert 0.4 < float(zero_frac) < 0.6
+
+    def test_half_normal_like_pytree(self):
+        import jax
+
+        key = jax.random.key(7)
+        tree = {"a": jnp.ones((4, 4)), "b": jnp.ones((4,))}
+        out = half_normal_like(key, tree)
+        assert out["a"].shape == (4, 4)
+        assert out["b"].shape == (4,)
+        # Non-zero elements should be normally distributed (finite)
+        assert jnp.all(jnp.isfinite(out["a"]))
+        assert jnp.all(jnp.isfinite(out["b"]))
+
+    def test_half_normal_like_different_keys_differ(self):
+        import jax
+
+        x = jnp.ones((20,))
+        out1 = half_normal_like(jax.random.key(0), x)
+        out2 = half_normal_like(jax.random.key(1), x)
+        assert not jnp.array_equal(out1, out2)

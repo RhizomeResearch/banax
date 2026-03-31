@@ -8,7 +8,7 @@ from banax.regularization import (
     hutchinson_jacobian_frobenius,
 )
 
-KEY = jax.random.PRNGKey(0)
+KEY = jax.random.key(0)
 X = jnp.array(1.5)  # scalar test point
 A = jnp.array(0.3)  # contraction factor
 
