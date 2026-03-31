@@ -3,6 +3,8 @@ name = "banax"
 version = "0.1.0"
 description = "Deep equilibrium models in JAX/Equinox"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.md"]
 authors = [
     { name = "Patrick Lambein", email = "patrick.lambein@rhizome-labs.com" }
 ]
@@ -12,9 +14,43 @@ dependencies = [
     "jax>=0.8.1",
     "jaxtyping>=0.3.3",
 ]
+keywords = [
+    "jax",
+    "equinox",
+    "deep-equilibrium",
+    "deq",
+    "fixed-point",
+    "implicit-differentiation",
+    "implicit-layers",
+    "deep-learning",
+    "neural-networks",
+    "machine-learning",
+    "differentiable-programming",
+    "scientific-computing",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/RhizomeResearch/banax"
+Repository = "https://github.com/RhizomeResearch/banax"
+Issues = "https://github.com/RhizomeResearch/banax/issues"
 
 [build-system]
-requires = ["uv_build>=0.9.29,<0.10.0"]
+requires = ["uv_build>=0.10.10,<0.11.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
