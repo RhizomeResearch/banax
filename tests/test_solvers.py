@@ -166,6 +166,7 @@ class TestBroyden:
         rtol: float = RTOL,
         max_steps: int = MAX_STEPS,
         ls_steps: int = 0,
+        spectral_clip=1.5,
     ):
         return Broyden(
             atol=atol,
@@ -173,6 +174,7 @@ class TestBroyden:
             max_steps=max_steps,
             history_size=10,
             ls_steps=ls_steps,
+            spectral_clip=spectral_clip,
         )
 
     def test_scalar_fixed_point(self):
@@ -218,6 +220,29 @@ class TestBroyden:
         sol_no, _ = solver_no_ls._solve((affine, (A, b)), x0=jnp.zeros(2))
         sol_ls, _ = solver_ls._solve((affine, (A, b)), x0=jnp.zeros(2))
         assert jnp.allclose(sol_no.value, sol_ls.value, atol=1e-4)
+
+    def test_spectral_clip_none_converges(self):
+        """spectral_clip=None (clipping disabled) still finds the fixed point."""
+        solver = self._solver(spectral_clip=None)
+        sol, _ = solver._solve((linear, (0.5, 1.0)), x0=jnp.array(0.0))
+        assert jnp.allclose(sol.value, 2.0, atol=1e-4)
+
+    def test_spectral_clip_tight_converges(self):
+        """A very tight spectral_clip forces clipping on most updates but
+        still converges — degrades gracefully toward Picard-like behaviour."""
+        solver = self._solver(spectral_clip=0.01, max_steps=500)
+        sol, _ = solver._solve((linear, (0.5, 1.0)), x0=jnp.array(0.0))
+        assert jnp.allclose(sol.value, 2.0, atol=1e-4)
+
+    def test_spectral_clip_same_result_as_default(self):
+        """Explicit spectral_clip=1.5 matches the default."""
+        A = jnp.array([[0.0, 0.25], [0.25, 0.0]])
+        b = jnp.array([1.0, 2.0])
+        sol_default, _ = self._solver()._solve((affine, (A, b)), x0=jnp.zeros(2))
+        sol_explicit, _ = self._solver(spectral_clip=1.5)._solve(
+            (affine, (A, b)), x0=jnp.zeros(2)
+        )
+        assert jnp.allclose(sol_default.value, sol_explicit.value, atol=1e-6)
 
 
 # ── TestAnderson ─────────────────────────────────────────────────────────

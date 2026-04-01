@@ -359,11 +359,16 @@ class Broyden[Z: T](Solver[Z, tuple]):
                 ``ls_steps > 0`` is therefore incompatible with
                 :class:`~banax.adjoint.BPTT` and
                 :class:`~banax.adjoint.Reversible` adjoints.
+        spectral_clip: Maximum allowed spectral norm for each rank-1 J^{-1} update.
+            Clamps ‖u‖·‖vT‖ ≤ spectral_clip to prevent the inverse-Jacobian
+            approximation from drifting on near-singular steps.
+            Set to ``None`` to disable. Default ``1.5``.
     """
 
     type State = tuple
     history_size: int = eqx.field(static=True, default=10, kw_only=True)
     ls_steps: int = eqx.field(static=True, default=0, kw_only=True)
+    spectral_clip: float | None = eqx.field(static=True, default=1.5, kw_only=True)
 
     def init(
         self, f: Fn[Z], x0: Z, *, trace_fn=None, trace_acc=None
@@ -379,6 +384,67 @@ class Broyden[Z: T](Solver[Z, tuple]):
         V = jnp.zeros((self.history_size, n))
         return (fx0, g_flat, U, V, jnp.array(0)), trace_acc
 
+    def _line_search(self, f, x_flat, dx, g_flat, unflatten, *, trace_fn, trace_acc):
+        # Armijo backtracking: halve alpha until
+        # ‖g(x + alpha·dx)‖² ≤ (1 − 2e−4·alpha)·‖g‖²
+        # tag="line_search" lets trace functions distinguish LS trials
+        # from main step evaluations. Trace functions used with
+        # Broyden(ls_steps>0) must accept **kwargs.
+        g_sq_curr = g_flat @ g_flat
+
+        def _ls_cond(_carry):
+            _alpha, _, _, _g_sq_next, _ = _carry
+            return _g_sq_next > (1 - 2e-4 * _alpha) * g_sq_curr
+
+        # Initial trial at alpha=1
+        x_next_flat_init = x_flat + dx
+        fx_next_init, fa_init = f(unflatten(x_next_flat_init))
+        if trace_fn is not None:
+            trace_acc = trace_fn(
+                trace_acc,
+                unflatten(x_next_flat_init),
+                fx_next_init,
+                fa_init,
+                tag="line_search",
+            )
+        fx_next_flat_init, _ = jax.flatten_util.ravel_pytree(fx_next_init)
+        g_next_flat_init = fx_next_flat_init - x_next_flat_init
+
+        def _ls_body(_carry):
+            _alpha, _x_next_flat, _fx_next, _g_sq_next, _acc = _carry
+            _alpha_new = _alpha * 0.5
+            _x_trial_flat = x_flat + _alpha_new * dx
+            _fx_trial, _fa = f(unflatten(_x_trial_flat))
+            if trace_fn is not None:
+                _acc = trace_fn(
+                    _acc,
+                    unflatten(_x_trial_flat),
+                    _fx_trial,
+                    _fa,
+                    tag="line_search",
+                )
+            _fx_trial_flat, _ = jax.flatten_util.ravel_pytree(_fx_trial)
+            _g_trial_flat = _fx_trial_flat - _x_trial_flat
+            return (
+                _alpha_new,
+                _x_trial_flat,
+                _fx_trial,
+                _g_trial_flat @ _g_trial_flat,
+                _acc,
+            )
+
+        init_carry = (
+            jnp.array(1.0),
+            x_next_flat_init,
+            fx_next_init,
+            g_next_flat_init @ g_next_flat_init,
+            trace_acc,
+        )
+        alpha, x_next_flat, fx_next, _, trace_acc = eqxi.while_loop(
+            _ls_cond, _ls_body, init_carry, max_steps=self.ls_steps, kind="lax"
+        )
+        return alpha * dx, x_next_flat, unflatten(x_next_flat), fx_next, trace_acc
+
     def step(
         self, f: Fn[Z], x: Z, state: State, *, trace_fn=None, trace_acc=None
     ) -> tuple[Z, Z, State, PyTree | None]:
@@ -391,93 +457,9 @@ class Broyden[Z: T](Solver[Z, tuple]):
         dx = g_flat - U.T @ Vg  # [n]
 
         if self.ls_steps > 0:
-            # Armijo backtracking: halve alpha until
-            # ‖g(x + alpha·dx)‖² ≤ (1 − 2e−4·alpha)·‖g‖²
-            g_sq_curr = g_flat @ g_flat
-
-            def _ls_cond(_carry):
-                _alpha, _x_next_flat, _fx_next, _g_sq_next = _carry[:4]
-                return _g_sq_next > (1 - 2e-4 * _alpha) * g_sq_curr
-
-            # Initial trial at alpha=1
-            x_next_flat_init = x_flat + dx
-            fx_next_init, fa_init = f(unflatten(x_next_flat_init))
-            if trace_fn is not None:
-                # tag="line_search" lets trace functions distinguish LS trials
-                # from main step evaluations. Trace functions used with
-                # Broyden(ls_steps>0) must accept **kwargs.
-                trace_acc = trace_fn(
-                    trace_acc,
-                    unflatten(x_next_flat_init),
-                    fx_next_init,
-                    fa_init,
-                    tag="line_search",
-                )
-            fx_next_flat_init, _ = jax.flatten_util.ravel_pytree(fx_next_init)
-            g_next_flat_init = fx_next_flat_init - x_next_flat_init
-
-            if trace_fn is not None:
-
-                def _ls_body(_carry):
-                    _alpha, _x_next_flat, _fx_next, _g_sq_next, _acc = _carry
-                    _alpha_new = _alpha * 0.5
-                    _x_trial_flat = x_flat + _alpha_new * dx
-                    _fx_trial, _fa = f(unflatten(_x_trial_flat))
-                    _acc = trace_fn(
-                        _acc,
-                        unflatten(_x_trial_flat),
-                        _fx_trial,
-                        _fa,
-                        tag="line_search",
-                    )
-                    _fx_trial_flat, _ = jax.flatten_util.ravel_pytree(_fx_trial)
-                    _g_trial_flat = _fx_trial_flat - _x_trial_flat
-                    return (
-                        _alpha_new,
-                        _x_trial_flat,
-                        _fx_trial,
-                        _g_trial_flat @ _g_trial_flat,
-                        _acc,
-                    )
-
-                init_carry = (
-                    jnp.array(1.0),
-                    x_next_flat_init,
-                    fx_next_init,
-                    g_next_flat_init @ g_next_flat_init,
-                    trace_acc,
-                )
-                alpha, x_next_flat, fx_next, _, trace_acc = eqxi.while_loop(
-                    _ls_cond, _ls_body, init_carry, max_steps=self.ls_steps, kind="lax"
-                )
-            else:
-
-                def _ls_body(_carry):
-                    _alpha, _, _, _ = _carry
-                    _alpha_new = _alpha * 0.5
-                    _x_trial_flat = x_flat + _alpha_new * dx
-                    _fx_trial, _ = f(unflatten(_x_trial_flat))
-                    _fx_trial_flat, _ = jax.flatten_util.ravel_pytree(_fx_trial)
-                    _g_trial_flat = _fx_trial_flat - _x_trial_flat
-                    return (
-                        _alpha_new,
-                        _x_trial_flat,
-                        _fx_trial,
-                        _g_trial_flat @ _g_trial_flat,
-                    )
-
-                init_carry = (
-                    jnp.array(1.0),
-                    x_next_flat_init,
-                    fx_next_init,
-                    g_next_flat_init @ g_next_flat_init,
-                )
-                alpha, x_next_flat, fx_next, _ = eqxi.while_loop(
-                    _ls_cond, _ls_body, init_carry, max_steps=self.ls_steps, kind="lax"
-                )
-
-            dx = alpha * dx
-            x_next = unflatten(x_next_flat)
+            dx, x_next_flat, x_next, fx_next, trace_acc = self._line_search(
+                f, x_flat, dx, g_flat, unflatten, trace_fn=trace_fn, trace_acc=trace_acc
+            )
         else:
             x_next_flat = x_flat + dx
             x_next = unflatten(x_next_flat)
@@ -504,6 +486,16 @@ class Broyden[Z: T](Solver[Z, tuple]):
         # Update U, V ring buffer at position idx % history_size
         slot = idx % self.history_size
         u_new = numerator / denom
+
+        # Spectral clipping: the rank-1 update adds u_new ⊗ vT to J^{-1}.
+        # Its spectral norm equals ‖u_new‖·‖vT‖.  When v^T dg is near zero
+        # (nearly-singular step), u_new can blow up and destabilise the
+        # inverse-Jacobian approximation.  Clamp the scale so the spectral
+        # norm of the rank-1 term stays ≤ spectral_clip.
+        if self.spectral_clip is not None:
+            spectral = jnp.sqrt((u_new @ u_new) * (vT @ vT))
+            scale = jnp.minimum(1.0, self.spectral_clip / (spectral + 1e-30))
+            u_new = u_new * scale
         U = U.at[slot].set(u_new)
         V = V.at[slot].set(vT)
 
