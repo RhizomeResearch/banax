@@ -66,12 +66,18 @@ or a tuple bundling the callable with its extra arguments.
 # bare callable — f takes only x
 adjoint(f, x0)
 
-# tuple with positional args — f(x, *args)
+# single extra argument — f(x, Qd)
+adjoint((f, Qd), x0)
+
+# multiple extra arguments — f(x, *args)
 adjoint((f, (W, b)), x0)
 
-# tuple with positional and keyword args — f(x, *args, **kwargs)
+# positional and keyword args — f(x, *args, **kwargs)
 adjoint((f, (W,), {"bias": b}), x0)
 ```
+
+When the second element is not a tuple it is wrapped automatically,
+so `(f, Qd)` is shorthand for `(f, (Qd,))`.
 
 This convention appears consistently
 across solvers, adjoints, and regularization functions.

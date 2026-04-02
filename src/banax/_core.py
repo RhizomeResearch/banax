@@ -7,7 +7,7 @@ types in downstream code:
     from banax._core import FSpec, Solution, Result, Stats
 """
 
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 from jaxtyping import Array, ArrayLike, Float, Int, PyTree, Shaped
 
 import equinox as eqx
@@ -45,7 +45,7 @@ type EquinoxLoopKind = DifferentiableLoopKind | Literal["lax"]
 
 type FSpec[Z] = (
     Callable[..., Z]
-    | tuple[Callable[..., Z], tuple]
+    | tuple[Callable[..., Z], Any]
     | tuple[Callable[..., Z], tuple, dict]
 )
 """Flexible function specification accepted by solvers and adjoints.
@@ -53,7 +53,8 @@ type FSpec[Z] = (
 Three forms are valid:
 
 - ``f`` — bare callable; invoked as ``f(x)``.
-- ``(f, args)`` — called as ``f(x, *args)``.
+- ``(f, args)`` — called as ``f(x, *args)``; if ``args`` is not a tuple it is
+  wrapped automatically, so ``(f, Qd)`` is equivalent to ``(f, (Qd,))``.
 - ``(f, args, kwargs)`` — called as ``f(x, *args, **kwargs)``.
 
 This convention appears consistently across :mod:`banax.solver`,
@@ -127,5 +128,7 @@ def _normalize_f_spec(f_spec):
         return f_spec, (), {}
     f, *rest = f_spec
     f_args = rest[0] if len(rest) > 0 else ()
+    if not isinstance(f_args, tuple):
+        f_args = (f_args,)
     f_kwargs = rest[1] if len(rest) > 1 else {}
     return f, f_args, f_kwargs
