@@ -112,6 +112,7 @@ def denoising_energy(
         Scalar regularization loss.
     """
     f, f_args, f_kwargs = _normalize_f_spec(f_spec)
+    x_star = jax.lax.stop_gradient(x_star)
     noise = jax.tree.map(lambda leaf: leaf * sigma, _randn_like(key, x_star))
     x_noisy = jax.tree.map(jnp.add, x_star, noise)
     delta = jax.tree.map(jnp.subtract, f(x_noisy, *f_args, **f_kwargs), x_star)
@@ -152,6 +153,7 @@ def hutchinson_jacobian_frobenius(
     def _f(_x):
         return f(_x, *f_args, **f_kwargs)
 
+    x_star = jax.lax.stop_gradient(x_star)
     _, pull = eqx.filter_vjp(_f, x_star)
     d = _size(x_star)
 
