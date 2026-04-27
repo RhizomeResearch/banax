@@ -786,7 +786,11 @@ class TestDtype:
         else:
             # Both tols off: any of CONVERGED / MAX_STEPS / DIVERGED is fine,
             # we only care that the loop didn't blow up at trace time.
-            assert int(sol.result) in (Result.CONVERGED, Result.MAX_STEPS, Result.DIVERGED)
+            assert int(sol.result) in (
+                Result.CONVERGED,
+                Result.MAX_STEPS,
+                Result.DIVERGED,
+            )
 
     @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
     @pytest.mark.parametrize("make_solver", _DTYPE_FACTORIES, ids=_DTYPE_IDS)
