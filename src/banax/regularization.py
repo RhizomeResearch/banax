@@ -24,7 +24,10 @@ def _randn_like(key, x):
     leaves, treedef = jax.tree.flatten(x)
     keys = jax.random.split(key, len(leaves))
     return treedef.unflatten(
-        [jax.random.normal(k, leaf.shape) for k, leaf in zip(keys, leaves)]
+        [
+            jax.random.normal(k, leaf.shape, dtype=leaf.dtype)
+            for k, leaf in zip(keys, leaves)
+        ]
     )
 
 
