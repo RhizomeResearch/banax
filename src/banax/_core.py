@@ -92,9 +92,12 @@ class Stats(eqx.Module):
     Attributes:
         steps: Number of fixed-point iterations executed.
         abs_err: Final absolute error ``‖f(x) − x‖`` at the last iterate.
-            Zero if ``atol=0.0`` (criterion disabled).
+            Always returned as ``float32`` regardless of the input dtype, so
+            that the convergence carry stays type-stable when ``x`` is
+            ``bf16``/``f16``.  Zero if ``atol=0.0`` (criterion disabled).
         rel_err: Final relative error ``‖f(x) − x‖ / ‖f(x)‖`` at the last
-            iterate.  Zero if ``rtol=0.0`` (criterion disabled).
+            iterate.  Same ``float32`` convention as ``abs_err``.  Zero if
+            ``rtol=0.0`` (criterion disabled).
     """
 
     steps: Step

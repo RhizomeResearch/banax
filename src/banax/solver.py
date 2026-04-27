@@ -149,14 +149,28 @@ class Solver[Z, S](eqx.Module):
                 return running
             return jnp.logical_and(running, step < step_budget)
 
+        # Convergence scalars are kept in float32 regardless of the input
+        # dtype.  This (a) keeps the eqxi.while_loop carry dtypes consistent
+        # when x is bf16/f16 (the body would otherwise return low-precision
+        # errors that mismatch the f32 init), and (b) gives enough precision
+        # for tolerance comparisons against atol/rtol that bf16's ~3 decimal
+        # digits cannot reliably resolve.
         def _loop_body(_carry: Carry) -> Carry:
             (x, step, aerr, rerr, trace_acc), solver_state = _carry
             x_next, fx_next, solver_state_next, trace_acc_next = self.step(
                 _f, x, solver_state, trace_fn=trace_fn, trace_acc=trace_acc
             )
 
-            aerr = _abs_err(x_next, fx_next) if self.atol > 0.0 else jnp.array(0.0)
-            rerr = _rel_err(x_next, fx_next) if self.rtol > 0.0 else jnp.array(0.0)
+            aerr = (
+                _abs_err(x_next, fx_next).astype(jnp.float32)
+                if self.atol > 0.0
+                else jnp.array(0.0, dtype=jnp.float32)
+            )
+            rerr = (
+                _rel_err(x_next, fx_next).astype(jnp.float32)
+                if self.rtol > 0.0
+                else jnp.array(0.0, dtype=jnp.float32)
+            )
             step += 1
 
             return (x_next, step, aerr, rerr, trace_acc_next), solver_state_next
@@ -165,8 +179,8 @@ class Solver[Z, S](eqx.Module):
             _f, x0, trace_fn=trace_fn, trace_acc=trace_init
         )
         step = jnp.array(0)
-        aerr = jnp.array(2 * self.atol)
-        rerr = jnp.array(2 * self.rtol)
+        aerr = jnp.array(2 * self.atol, dtype=jnp.float32)
+        rerr = jnp.array(2 * self.rtol, dtype=jnp.float32)
 
         carry = ((x0, step, aerr, rerr, trace_acc), solver_state_init)
 
@@ -380,8 +394,11 @@ class Broyden[Z: T](Solver[Z, tuple]):
         n = x_flat.shape[0]
         fx_flat, _ = jax.flatten_util.ravel_pytree(fx0)
         g_flat = fx_flat - x_flat
-        U = jnp.zeros((self.history_size, n))
-        V = jnp.zeros((self.history_size, n))
+        # U, V must match the input dtype — they are mixed with g_flat in
+        # V @ g_flat / U.T @ Vg, which fails under strict promotion if the
+        # buffers default to f32 and the input is bf16/f16.
+        U = jnp.zeros((self.history_size, n), dtype=x_flat.dtype)
+        V = jnp.zeros((self.history_size, n), dtype=x_flat.dtype)
         return (fx0, g_flat, U, V, jnp.array(0)), trace_acc
 
     def _line_search(self, f, x_flat, dx, g_flat, unflatten, *, trace_fn, trace_acc):
@@ -434,7 +451,7 @@ class Broyden[Z: T](Solver[Z, tuple]):
             )
 
         init_carry = (
-            jnp.array(1.0),
+            jnp.array(1.0, dtype=x_flat.dtype),
             x_next_flat_init,
             fx_next_init,
             g_next_flat_init @ g_next_flat_init,
@@ -575,8 +592,12 @@ class Anderson[Z: T](Solver[Z, tuple]):
         n = x_flat.shape[0]
         fx_flat, _ = jax.flatten_util.ravel_pytree(fx0)
         g_flat = fx_flat - x_flat
-        X_hist = jnp.zeros((self.depth, n))
-        G_hist = jnp.zeros((self.depth, n))
+        # History buffers must match the input dtype — they are mixed with
+        # x_flat / g_flat on every step (gather + subtract), which fails under
+        # strict promotion if the buffers default to f32 and the input is
+        # bf16/f16.
+        X_hist = jnp.zeros((self.depth, n), dtype=x_flat.dtype)
+        G_hist = jnp.zeros((self.depth, n), dtype=x_flat.dtype)
         X_hist = X_hist.at[0].set(x_flat)
         G_hist = G_hist.at[0].set(g_flat)
         return (fx0, g_flat, X_hist, G_hist, jnp.array(1)), trace_acc
@@ -601,14 +622,20 @@ class Anderson[Z: T](Solver[Z, tuple]):
         DG = DG * mask[:, None]
         DX = DX * mask[:, None]
 
-        # Solve normal equations: (DG^T DG + ridge * I) gamma = DG^T g
-        GTG = DG @ DG.T + self.ridge * jnp.eye(self.depth)
-        GTg = DG @ g_flat
+        # Solve the small (depth × depth) least-squares system at >= float32.
+        # jnp.linalg.solve does not support bf16, and bf16 is too imprecise
+        # for stable normal equations even when the cholesky path is used.
+        # f64 inputs are preserved (we only ever promote upward).
+        solve_dtype = jnp.float64 if x_flat.dtype == jnp.float64 else jnp.float32
+        GTG = (DG @ DG.T).astype(solve_dtype) + self.ridge * jnp.eye(
+            self.depth, dtype=solve_dtype
+        )
+        GTg = (DG @ g_flat).astype(solve_dtype)
         if self.use_linalg:
             gamma = jnp.linalg.solve(GTG, GTg)
         else:
             gamma = _cholesky_solve(GTG, GTg, self.depth)
-        gamma = gamma * mask
+        gamma = gamma.astype(x_flat.dtype) * mask
 
         # Anderson update: x_next = x + beta * g - (DX + beta * DG) @ gamma
         x_next_flat = x_flat + self.damp * g_flat - (DX + self.damp * DG).T @ gamma

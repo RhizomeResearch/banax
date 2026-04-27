@@ -685,3 +685,158 @@ class TestPytreeHelpers:
         out1 = half_normal_like(jax.random.key(0), x)
         out2 = half_normal_like(jax.random.key(1), x)
         assert not jnp.array_equal(out1, out2)
+
+
+# ── TestDtype ─────────────────────────────────────────────────────────────
+
+
+# Solver factories parameterised by tolerance config.  Each factory takes the
+# atol/rtol pair and returns a solver instance with deterministic settings —
+# this keeps the dtype tests focused on the type-promotion behaviour rather
+# than tuning per-solver hyperparameters.
+def _picard(atol, rtol):
+    return Picard(atol=atol, rtol=rtol, max_steps=80)
+
+
+def _relaxed(atol, rtol):
+    return Relaxed(damp=0.7, atol=atol, rtol=rtol, max_steps=80)
+
+
+def _reversible(atol, rtol):
+    return ReversibleSolver(
+        damp=0.5, atol=atol, rtol=rtol, max_steps=20, loop_kind="lax"
+    )
+
+
+def _broyden(atol, rtol):
+    return Broyden(atol=atol, rtol=rtol, max_steps=80, history_size=5)
+
+
+def _broyden_ls(atol, rtol):
+    return Broyden(atol=atol, rtol=rtol, max_steps=80, history_size=5, ls_steps=3)
+
+
+def _anderson_linalg(atol, rtol):
+    return Anderson(atol=atol, rtol=rtol, max_steps=80, depth=3, use_linalg=True)
+
+
+def _anderson_cholesky(atol, rtol):
+    return Anderson(atol=atol, rtol=rtol, max_steps=80, depth=3, use_linalg=False)
+
+
+_DTYPE_SOLVERS = [
+    (_picard, "picard"),
+    (_relaxed, "relaxed"),
+    (_reversible, "reversible"),
+    (_broyden, "broyden"),
+    (_broyden_ls, "broyden_ls"),
+    (_anderson_linalg, "anderson_linalg"),
+    (_anderson_cholesky, "anderson_cholesky"),
+]
+_DTYPE_FACTORIES = [s[0] for s in _DTYPE_SOLVERS]
+_DTYPE_IDS = [s[1] for s in _DTYPE_SOLVERS]
+
+# Tolerance configurations exercised across every solver.  Both-zero shakes
+# out the carry without a tolerance branch; atol-only and rtol-only verify
+# each branch independently; both-active checks the conjunction.
+_TOL_CONFIGS = [
+    (1e-2, 0.0, "atol_only"),
+    (0.0, 1e-2, "rtol_only"),
+    (1e-2, 1e-2, "atol_and_rtol"),
+    (0.0, 0.0, "both_zero"),
+]
+_TOL_PARAMS = [(a, r) for a, r, _ in _TOL_CONFIGS]
+_TOL_IDS = [name for *_, name in _TOL_CONFIGS]
+
+
+class TestDtype:
+    """Solvers must work with low-precision inputs (bf16, f16).
+
+    Regression tests for the dtype-mismatch bugs that prevented running
+    banax on bf16 training pipelines:
+
+      * ``Solver._solve`` previously kept ``aerr``/``rerr`` at the input
+        dtype in the loop body but at f32 in the init, breaking the
+        ``eqxi.while_loop`` carry signature for bf16 inputs.
+      * ``Broyden`` allocated ``U``/``V`` and the line-search ``alpha`` at
+        f32 by default, mismatching the bf16 ``g_flat``/``dx``.
+      * ``Anderson`` allocated history buffers and ``jnp.eye`` at f32, and
+        ``jnp.linalg.solve`` does not even support bf16, so the small LS
+        system needs an explicit promotion to f32 with the result cast back.
+    """
+
+    @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+    @pytest.mark.parametrize("atol,rtol", _TOL_PARAMS, ids=_TOL_IDS)
+    @pytest.mark.parametrize("make_solver", _DTYPE_FACTORIES, ids=_DTYPE_IDS)
+    def test_scalar_low_precision(self, make_solver, atol, rtol, dtype):
+        """Low-precision scalar solve runs without dtype errors and preserves input dtype."""
+        x0 = jnp.array(0.0, dtype=dtype)
+        a = jnp.array(0.5, dtype=dtype)
+        b = jnp.array(1.0, dtype=dtype)
+        sol, _ = make_solver(atol, rtol)._solve((linear, (a, b)), x0)
+        # Fixed point of f(x) = 0.5*x + 1 is x* = 2.  The point of this test
+        # is the dtype carry, not numerical accuracy: with both tols disabled
+        # the quasi-Newton solvers overshoot in f16 and trip the NaN guard
+        # (correct behaviour, reported as DIVERGED), so accuracy is only
+        # asserted when at least one tolerance is active.
+        assert sol.value.dtype == dtype
+        if atol > 0.0 or rtol > 0.0:
+            assert jnp.isfinite(sol.value)
+            assert jnp.allclose(sol.value.astype(jnp.float32), 2.0, atol=0.05)
+        else:
+            # Both tols off: any of CONVERGED / MAX_STEPS / DIVERGED is fine,
+            # we only care that the loop didn't blow up at trace time.
+            assert int(sol.result) in (Result.CONVERGED, Result.MAX_STEPS, Result.DIVERGED)
+
+    @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+    @pytest.mark.parametrize("make_solver", _DTYPE_FACTORIES, ids=_DTYPE_IDS)
+    def test_vector_low_precision(self, make_solver, dtype):
+        """Vector solve with non-trivial spectral radius works in low precision."""
+        A = jnp.array([[0.0, 0.25], [0.25, 0.0]], dtype=dtype)
+        b = jnp.array([1.0, 2.0], dtype=dtype)
+        x0 = jnp.zeros(2, dtype=dtype)
+        sol, _ = make_solver(1e-2, 0.0)._solve((affine, (A, b)), x0)
+        # Closed-form fixed point computed in f32 to avoid bf16 round-off
+        # in the reference value itself.
+        expected = jnp.linalg.solve(
+            jnp.eye(2) - A.astype(jnp.float32), b.astype(jnp.float32)
+        )
+        assert sol.value.dtype == dtype
+        assert jnp.allclose(sol.value.astype(jnp.float32), expected, atol=0.05)
+
+    @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+    @pytest.mark.parametrize("make_solver", _DTYPE_FACTORIES, ids=_DTYPE_IDS)
+    def test_stats_are_float32(self, make_solver, dtype):
+        """``Stats.abs_err`` / ``rel_err`` are always f32 — see ``Stats`` docstring.
+
+        This is the load-bearing invariant for the loop carry: keeping the
+        scalar in f32 lets the body re-enter with the same dtype regardless
+        of the input precision.
+        """
+        x0 = jnp.array(0.0, dtype=dtype)
+        a = jnp.array(0.5, dtype=dtype)
+        b = jnp.array(1.0, dtype=dtype)
+        sol, _ = make_solver(1e-2, 1e-2)._solve((linear, (a, b)), x0)
+        assert sol.stats.abs_err.dtype == jnp.float32
+        assert sol.stats.rel_err.dtype == jnp.float32
+
+    @pytest.mark.parametrize("make_solver", _DTYPE_FACTORIES, ids=_DTYPE_IDS)
+    def test_pytree_bf16(self, make_solver):
+        """Pytree inputs with bf16 leaves should also work."""
+        x0 = {
+            "a": jnp.array(0.0, dtype=jnp.bfloat16),
+            "b": jnp.array(0.0, dtype=jnp.bfloat16),
+        }
+
+        def f(x):
+            return {
+                "a": jnp.bfloat16(0.5) * x["a"] + jnp.bfloat16(1.0),
+                "b": jnp.bfloat16(0.25) * x["b"] + jnp.bfloat16(3.0),
+            }
+
+        sol, _ = make_solver(1e-2, 0.0)._solve(f, x0)
+        # Fixed point: a*=2, b*=4. bf16 gives ~0.05 absolute precision.
+        assert sol.value["a"].dtype == jnp.bfloat16
+        assert sol.value["b"].dtype == jnp.bfloat16
+        assert jnp.allclose(sol.value["a"].astype(jnp.float32), 2.0, atol=0.05)
+        assert jnp.allclose(sol.value["b"].astype(jnp.float32), 4.0, atol=0.05)
